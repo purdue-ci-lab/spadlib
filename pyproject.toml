@@ -17,4 +17,4 @@ dependencies = [
 
 [project.optional-dependencies]
 cupy12 = ["cupy-cuda12x"]
-cupy13 = ["cupy-cuda13x]
+cupy13 = ["cupy-cuda13x"]
