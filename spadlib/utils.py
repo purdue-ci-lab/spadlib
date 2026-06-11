@@ -16,56 +16,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-class TempMemmap:
-    """
-    Temporary np.memmap wrapper that cleans up automatically.
-    """
-
-    def __init__(self, shape, dtype=np.float32, mode="w+"):
-        # Create a real temporary filename that np.memmap can use
-        tmp = tempfile.NamedTemporaryFile(delete=False)
-        self.filename = tmp.name
-        tmp.close()  # close file handle so memmap can reopen it
-
-        # Create the memory-mapped array
-        self.data = np.memmap(self.filename, dtype=dtype, mode=mode, shape=shape)
-
-        # Register cleanup handlers
-        atexit.register(self._cleanup)
-        # weakref ensures cleanup even if the object is deleted before interpreter exit
-        self._finalizer = weakref.finalize(self, TempMemmap._delete_file, self.filename)
-
-    def _cleanup(self):
-        """Flush and delete on normal interpreter exit."""
-        if hasattr(self, "data"):
-            try:
-                self.data.flush()
-                self.data._mmap.close()
-            except Exception:
-                pass
-        TempMemmap._delete_file(self.filename)
-
-    @staticmethod
-    def _delete_file(fname):
-        """Safely delete file if it exists."""
-        try:
-            if os.path.exists(fname):
-                os.remove(fname)
-        except Exception:
-            pass
-
-    def close(self):
-        """Manually close and remove file."""
-        self._cleanup()
-        self._finalizer.detach()  # prevent double cleanup
-
-    def __enter__(self):
-        return self.data
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-
 def dot_clean_dir(path):
     """
     Run macOS `dot_clean` on a directory to remove `._*` AppleDouble dotfiles,
