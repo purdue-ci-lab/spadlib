@@ -67,6 +67,9 @@ def apply_deadtime_1d(timestamps, deadtime):
     """
     if len(timestamps) == 0:
         return timestamps
+    is_sorted = np.all(timestamps[:-1] <= timestamps[1:])
+    if not is_sorted:
+        timestamps = np.sort(timestamps)
     accepted = [timestamps[0]]
     for t in timestamps[1:]:
         if t - accepted[-1] >= deadtime:
