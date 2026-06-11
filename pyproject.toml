@@ -1,7 +1,20 @@
 [project]
 name = "spadlib"
 version = "0.1.0"
-description = "Add your description here"
+description = "Collection of utilities for reading/writing single-photon data from quanta and asynchronous SPAD sensors."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "dask[array]>=2026.3.0",
+    "matplotlib>=3.10.9",
+    "numpy>=2.4.6",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
+    "scipy>=1.17.1",
+    "tqdm>=4.68.2",
+    "zarr>=3.1.6",
+]
+
+[project.optional-dependencies]
+cupy12 = ["cupy-cuda12x"]
+cupy13 = ["cupy-cuda13x]
