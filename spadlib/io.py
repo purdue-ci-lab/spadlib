@@ -230,7 +230,7 @@ def write_frames_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
 # ---------------------------------------------------------------------------
 # SPAD readers
 # ---------------------------------------------------------------------------
-def read_pixel_timeseries_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
+def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
     """
     Reads a folder of .npy files containing per-pixel timestamp arrays.
     Each .npy file is expected to be named with the pattern "posX{X}_posY{Y}.npy"
@@ -316,61 +316,6 @@ def read_async_spad_zarr(path, load_data=True):
         y = y[:]
         x = x[:]
     return (t, y, x), pixel_timeseries, root.attrs
-
-
-def read_spad_bin(
-    path, nframes, h, w, keep_prob=1.0, downsample=1, hotpix_thresh=None, hotpix_kernel_size=5,
-    downsample_method="resize",
-):
-    """
-    Reads a .bin file from a SPAD 512 camera and returns a numpy array of shape
-    (nframes, h, w) containing the binary pixel data, with optional hot-pixel
-    correction, thinning, and downsampling.
-
-    Originally read_spadbin(path, nframes, h, w, keep_prob, downsample, hotpix_thresh,
-    hotpix_kernel_size, downsample_method).
-
-    There are probably hundreds of thousands of frames in the .bin, so set nframes
-    accordingly.
-
-    Args:
-        hotpix_thresh (float or None): if not None, will do hot pixel correction based on
-            the given stddev threshold and kernel size.
-        downsample_method (str): "resize" to use cv2 resize, "slice" to use slicing.
-    """
-    warnings.warn(
-        "read_spad_bin is old and slow and has overhead. Use read_quanta_bin instead and process it after reading.",
-        DeprecationWarning,
-        stacklevel=2
-    )
-    nbytes_per_frame = h * w // 8
-    with open(path, "rb") as f:
-        data = np.frombuffer(f.read(nframes * nbytes_per_frame), dtype=np.uint8)
-    databit = np.unpackbits(data)
-    wholetotalbit = databit.reshape((nframes, w, h))
-    # transpose width/height and set origin to top-left
-    wholetotalbit = wholetotalbit.transpose(0, 2, 1)[:, ::-1, :]
-    if hotpix_thresh is not None:
-        arr_hotpixel_corrected, hot_pixels, neighbor_mean = correct_hotpixels_conv(
-            wholetotalbit, thresh_std=hotpix_thresh, kernel_size=hotpix_kernel_size,
-        )
-        nhotpixs = np.sum(hot_pixels)
-        wholetotalbit = arr_hotpixel_corrected
-        logger.info(f"Replaced {nhotpixs} hot pixels by neighbor comparison (threshold={hotpix_thresh})")
-    if keep_prob < 1.0:
-        nevents_orig = int(np.sum(wholetotalbit))
-        wholetotalbit = thin_frames_uniform(wholetotalbit, keep_prob, seed=42)
-        total_kept = int(np.sum(wholetotalbit))
-        logger.info(f"Kept {total_kept} of {nevents_orig} points after thinning")
-    if downsample > 1:
-        if downsample_method == "resize":
-            downsampled = []
-            for frame in tqdm(wholetotalbit, desc="Downsampling frames"):
-                downsampled.append(cv2.resize(frame, (w // downsample, h // downsample), interpolation=cv2.INTER_NEAREST))
-            wholetotalbit = np.array(downsampled)
-        elif downsample_method == "slice":
-            wholetotalbit = wholetotalbit[:, ::int(downsample), ::int(downsample)]
-    return wholetotalbit
 
 
 def read_quanta_bin(path, H=512, W=512):

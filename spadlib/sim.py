@@ -51,28 +51,6 @@ def simulate_ihpp1d(intensity_func, T, max_rate=None, seed=None):
     return event_times[accepted]
 
 
-def simulate_ihpp1d_torch(intensity_func, T, max_rate, device="cpu"):
-    """
-    simulate_ihpp1d except torch. Will crash if used with finufft for some reason.
-    """
-    # put in here so it doesn't crash finufft
-    import torch
-    # Generate homogeneous Poisson events
-    n_events = int(2 * T * max_rate)  # Overestimate the number of events
-    u = torch.rand(n_events, device=device)
-    inter_arrival_times = -torch.log(u) / max_rate
-    event_times = torch.cumsum(inter_arrival_times, dim=0)
-
-    # Keep only those within [0, T]
-    event_times = event_times[event_times <= T]
-
-    # Thinning step
-    acceptance_probs = torch.rand(event_times.size(0), device=device)
-    accepted = acceptance_probs <= (intensity_func(event_times) / max_rate)
-
-    return event_times[accepted]
-
-
 def apply_deadtime_1d(timestamps, deadtime):
     """
     Applies a dead-time effect to a sequence of event timestamps by dropping events
