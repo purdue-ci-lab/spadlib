@@ -2,7 +2,9 @@
 Read/write utilities for color video and image data (as opposed to the SPAD
 quanta data handled by ``spadlib.io``). Also includes simple frame resizing.
 """
+import contextlib
 import logging
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -97,7 +99,7 @@ def read_image_dir(path, grayscale: bool = False) -> np.ndarray:
 
 def write_video(
     frames: np.ndarray, path, res_scale=1.0, playback_fps=None, gamma=1.0, cmap=None, fileformat=None,
-    vmin=None, vmax=None, quantile=None, framenames=None
+    vmin=None, vmax=None, quantile=None, framenames=None, verbose=False
 ):
     """
     Saves video frame arrays to a video file or sequence of PNGs. If path has no extension,
@@ -143,7 +145,8 @@ def write_video(
         else:
             vmin = float(np.min(frames))
             if vmin >= 0:
-                logger.info("vmin was not specified and frames have non-negative values, so using vmin=0 for more accurate scaling")
+                if verbose:
+                    logger.info(f"vmin was not specified and frames have non-negative values, so using vmin=0 for more accurate scaling")
                 vmin = 0.0
 
     H, W = frames.shape[1], frames.shape[2]
@@ -173,7 +176,11 @@ def write_video(
 
     if not is_video_file:
         allpaths = []
-    for i in tqdm(range(max_frames), desc="Writing video frames"):
+    if verbose:
+        frameiterator = tqdm(range(max_frames), desc="Writing video frames")
+    else:
+        frameiterator = range(max_frames)
+    for i in frameiterator:
         intensity = (np.clip(frames[i], vmin, vmax) - vmin) / (vmax - vmin)  # normalize to [0,1]
         if gamma != 1:
             intensity = intensity ** gamma
@@ -196,7 +203,7 @@ def write_video(
                 frame_path = path / f"{framenames[i]}.{fileformat}"
             if fileformat.lower() == "png":
                 # higher compression level because there's thousands of frames
-                # (still lossless because it's a PNG)
+                # reminder for anyone reading here; IT'S LOSSLESS COMPRESSION BECAUSE IT'S A PNG
                 cv2.imwrite(str(frame_path), bgr_mapped, [cv2.IMWRITE_PNG_COMPRESSION, 5])
             else:
                 cv2.imwrite(str(frame_path), bgr_mapped)
@@ -206,6 +213,36 @@ def write_video(
     if not is_video_file:
         return allpaths
     return path
+
+
+def write_frames_tiled(frames, path, sep=1, cmap='viridis'):
+    """Save a [N, H, W] float numpy array as a tiled contact-sheet PNG.
+
+    Frames are laid out in a roughly square grid separated by white lines.
+    The colormap range is anchored at 0 if all values are non-negative.
+    """
+    cmap_fn = plt.get_cmap(cmap)
+    vmin_g = float(frames.min())
+    vmax_g = float(frames.max())
+    if vmin_g >= 0:
+        vmin_g = 0.0
+    vmax_g = max(vmax_g, vmin_g + 1e-8)
+    n, Ph, Pw = frames.shape
+    ncols = math.ceil(math.sqrt(2.0 * n))
+    nrows = math.ceil(n / ncols)
+    ch = nrows * Ph + (nrows - 1) * sep
+    cw = ncols * Pw + (ncols - 1) * sep
+    canvas = np.full((ch, cw), np.nan, dtype=np.float32)
+    for f in range(n):
+        r, c = divmod(f, ncols)
+        y0 = r * (Ph + sep)
+        x0 = c * (Pw + sep)
+        canvas[y0:y0 + Ph, x0:x0 + Pw] = frames[f]
+    norm = (np.clip(canvas, vmin_g, vmax_g) - vmin_g) / (vmax_g - vmin_g)
+    norm = np.where(np.isnan(norm), 0.0, norm)
+    rgb = (cmap_fn(norm)[..., :3] * 255).astype(np.uint8)
+    rgb[np.isnan(canvas)] = 255
+    cv2.imwrite(str(path), rgb[..., ::-1], [cv2.IMWRITE_PNG_COMPRESSION, 5])
 
 
 def avi_to_mov(avi_path, mov_path=None):
@@ -253,13 +290,36 @@ def get_codec_for_format(format: str):
         raise ValueError(f"I haven't added the codec for: {format}")
 
 
+@contextlib.contextmanager
+def _suppress_c_stderr():
+    """Redirect C-level stderr (fd 2) to /dev/null for the duration of the block.
+
+    Needed for FFMPEG codec probing: failed codecs print directly to the C stderr
+    file descriptor, bypassing Python's logging and sys.stderr entirely.
+    """
+    old_fd = os.dup(2)
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+        os.close(devnull_fd)
+
+
+_mp4_codec_cache: str | None = None
+
+
 def _get_mp4_codec() -> str:
+    """Select the best available H.264/MP4 codec, cached after the first call.
+
+    Probes avc1 then mp4v. FFMPEG error output during the probe is suppressed
+    at the C file-descriptor level since it bypasses Python logging entirely.
     """
-    Test whether avc1 (H.264) is available in this OpenCV build by writing a small
-    test video. Falls back to mp4v if not (e.g. Colab silently fails avc1 but mp4v
-    works). Raises RuntimeError if neither works.
-    """
-    import os
+    global _mp4_codec_cache
+    if _mp4_codec_cache is not None:
+        return _mp4_codec_cache
     import tempfile
     test_frame = np.zeros((64, 64, 3), dtype=np.uint8)
     for codec in ["avc1", "mp4v"]:
@@ -267,16 +327,18 @@ def _get_mp4_codec() -> str:
             tmp_path = f.name
         try:
             fourcc = cv2.VideoWriter_fourcc(*codec)
-            writer = cv2.VideoWriter(tmp_path, fourcc, 24, (64, 64), isColor=True)
-            writer.write(test_frame)
-            writer.release()
+            with _suppress_c_stderr():
+                writer = cv2.VideoWriter(tmp_path, fourcc, 24, (64, 64), isColor=True)
+                writer.write(test_frame)
+                writer.release()
             if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
                 logger.info(f"MP4 codec selected: {codec}")
+                _mp4_codec_cache = codec
                 return codec
             else:
-                logger.warning(f"MP4 codec '{codec}' produced no output, trying next...")
+                logger.debug(f"MP4 codec '{codec}' produced no output, trying next...")
         except Exception as e:
-            logger.warning(f"MP4 codec '{codec}' raised an error: {e}, trying next...")
+            logger.debug(f"MP4 codec '{codec}' raised an error: {e}, trying next...")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
