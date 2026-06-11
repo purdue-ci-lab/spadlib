@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
+import warnings
 
 import cv2
 import numpy as np
@@ -337,6 +338,11 @@ def read_spad_bin(
             the given stddev threshold and kernel size.
         downsample_method (str): "resize" to use cv2 resize, "slice" to use slicing.
     """
+    warnings.warn(
+        "read_spad_bin is old and slow and has overhead. Use read_quanta_bin instead and process it after reading.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     nbytes_per_frame = h * w // 8
     with open(path, "rb") as f:
         data = np.frombuffer(f.read(nframes * nbytes_per_frame), dtype=np.uint8)
