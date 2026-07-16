@@ -159,6 +159,20 @@ def thin_frames_counts_dask(frames, keep_prob, dcr_rate=None, seed=None):
     return out
 
 
+def correct_hotpixels(frames, probablity_base="hotpixels", hp_threshold: float = 2.0, kernel_size: int = 3):
+    """
+    Correct hot pixels in SPAD data using the SPADHotpixelTool.
+
+    Args:
+        frames: 3D numpy array of shape (T, H, W) representing the SPAD data.
+        probablity_base: Base for probability calculation, either "hotpixels" or "all".
+        hp_threshold: Threshold multiplier for hot pixel detection.
+        kernel_size: Size of the kernel for background estimation.
+    """
+    hotpixtool = SPADHotpixelTool(frames)
+    return hotpixtool.correct_hotpixels(probablity_base=probablity_base, hp_threshold=hp_threshold, kernel_size=kernel_size)
+
+
 def correct_hotpixels_conv(arr, thresh_std=5.0, kernel_size=5):
     """
     Hot pixel correction via convolutional neighbor statistics.
