@@ -5,13 +5,13 @@ Collection of utilities for reading/writing single-photon data from quanta and a
 ## Installation
 
 ```shell
-pip install git+https://github.com/jerukan/spadlib.git
+pip install git+https://github.com/purdue-ci-lab/spadlib.git
 ```
 
 While this repo is private, you should install it with ssh instead.
 
 ```shell
-pip install git+ssh://git@github.com/jerukan/spadlib.git
+pip install git+ssh://git@github.com:purdue-ci-lab/spadlib.git
 ```
 
 CUDA support with CuPy depends on your CUDA Toolkit version
