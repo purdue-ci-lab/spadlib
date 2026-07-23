@@ -29,3 +29,10 @@ If the CUDA Toolkit is not installed already, install CuPy like the following:
 ```shell
 pip install "cupy-cuda12x[ctk]"
 ```
+
+## Contributing
+
+```shell
+uv sync
+uv run pytest
+```

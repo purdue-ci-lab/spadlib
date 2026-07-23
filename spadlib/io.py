@@ -8,6 +8,7 @@ throughout spadlib:
 
 Also includes generic array <-> Zarr helpers used by the SPAD writers.
 """
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +22,7 @@ import zarr
 from tqdm import tqdm
 
 from spadlib.processing import correct_hotpixels_conv, thin_events_uniform, thin_frames_uniform
-from spadlib.utils import dot_clean_dir, is_json_serializable, make_json_serializable
+from spadlib.utils import dot_clean_dir, is_json_serializable, make_json_serializable, natural_sort_key
 
 try:
     import cupy as cp
@@ -341,23 +342,190 @@ def read_quanta_bin(path, H=512, W=512):
     return frames
 
 
-def read_quanta_dir(path, H=512, W=512):
+def _load_mat_array(mat_path, key=None):
     """
-    Read a directory of binary SPAD512 files and concatenate them into a single array.
+    Load a single 3D array from a MATLAB ``.mat`` file, as stored (``(H, W, T)``).
+
+    Supports both MATLAB v7/v7.2 files (via ``scipy.io.loadmat``) and v7.3 HDF5-based
+    files (via ``h5py``, imported lazily so it is only required for v7.3 data).
+
+    Args:
+        mat_path (str or Path): Path to the .mat file.
+        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
+            array. If None, expects exactly one 3D array (v7.3) or one non-reserved
+            variable (v7/v7.2) in the file.
+    """
+    mat_path = Path(mat_path)
+
+    # Try scipy first (handles v7/v7.2; raises NotImplementedError for v7.3 files).
+    scipy_error = None
+    try:
+        import scipy.io
+        d = scipy.io.loadmat(mat_path.as_posix())
+        candidates = [k for k in d.keys() if not k.startswith("__")]
+        if not candidates:
+            raise ValueError(f"No array variables found in {mat_path.name}")
+        if key is None:
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"{mat_path.name}: multiple variables found {candidates}. "
+                    f"Specify one with key=."
+                )
+            key_use = candidates[0]
+        else:
+            if key not in d:
+                raise KeyError(f"{mat_path.name}: key '{key}' not found. Available: {candidates}")
+            key_use = key
+        return np.asarray(d[key_use])
+    except NotImplementedError:
+        pass  # v7.3 file; fall through to h5py
+    except Exception as e:
+        scipy_error = e
+
+    # Try h5py (v7.3 / HDF5-backed .mat).
+    try:
+        import h5py
+        with h5py.File(mat_path.as_posix(), "r") as f:
+            if key is None:
+                datasets = []
+
+                def _visit(name, obj):
+                    if hasattr(obj, "shape") and hasattr(obj, "dtype") and len(getattr(obj, "shape", ())) == 3:
+                        datasets.append(name)
+
+                f.visititems(_visit)
+                if not datasets:
+                    raise ValueError(f"{mat_path.name}: no 3D datasets found (v7.3).")
+                if len(datasets) != 1:
+                    raise ValueError(
+                        f"{mat_path.name}: multiple 3D datasets found {datasets}. "
+                        f"Specify one with key= (use full path inside the .mat)."
+                    )
+                key_use = datasets[0]
+            else:
+                key_use = key
+                if key_use not in f:
+                    raise KeyError(f"{mat_path.name}: dataset '{key_use}' not found in v7.3 file.")
+            return np.array(f[key_use])  # loads this part into RAM (one .mat at a time)
+    except Exception as e:
+        if scipy_error is not None:
+            raise RuntimeError(
+                f"Failed to load {mat_path.name} with scipy ({scipy_error}) and h5py ({e})."
+            ) from e
+        raise
+
+
+def read_quanta_mat(path, key=None):
+    """
+    Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
+    (consistent with :func:`read_quanta_bin`).
+
+    The volume is assumed to be stored as ``(H, W, T)`` (MATLAB WxHxT convention) and is
+    transposed to ``(T, H, W)`` on read. Dtype is preserved from the file.
+
+    Args:
+        path (str or Path): Path to the .mat file.
+        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
+            volume. If None, expects exactly one 3D array in the file.
+    """
+    arr = _load_mat_array(path, key=key)
+    if arr.ndim != 3:
+        raise ValueError(f"{Path(path).name}: expected 3D array, got shape {arr.shape}")
+    # (H, W, T) -> (T, H, W)
+    return np.transpose(arr, (2, 0, 1))
+
+
+def _read_mat_meta(path):
+    """
+    Read the optional MATLAB-volume metadata sidecar from a directory.
+
+    Looks for ``info.json`` first, then falls back to any single ``*.json`` file. The
+    JSON is expected to carry ``no_frames_total``, ``no_parts`` and ``no_frames`` keys
+    (as produced by the concat-to-zarr tooling) but any/all may be absent.
+
+    Returns:
+        dict or None: parsed metadata, or None if no readable sidecar is found.
+    """
+    path = Path(path)
+    meta_path = path / "info.json"
+    if not meta_path.is_file():
+        candidates = sorted(path.glob("*.json"))
+        if not candidates:
+            return None
+        meta_path = candidates[0]
+    try:
+        return json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not parse metadata file {meta_path.name}: {e}")
+        return None
+
+
+def _read_quanta_mat_dir(path, matpaths, key=None):
+    """
+    Read and concatenate a directory of MATLAB ``.mat`` quanta volumes into ``(T, H, W)``.
+
+    Files are read in the caller-provided (natural sorted) order and concatenated along
+    T. If an ``info.json`` sidecar is present, its ``no_parts``/``no_frames_total`` are
+    used to validate the result (mismatches are logged as warnings, not fatal).
+    """
+    meta = _read_mat_meta(path)
+    no_parts = meta.get("no_parts") if meta else None
+    if no_parts is not None and len(matpaths) != int(no_parts):
+        logger.warning(f"Metadata says no_parts={no_parts}, but found {len(matpaths)} .mat files.")
+
+    all_frames = []
+    for f in tqdm(matpaths, desc="Reading .mat files from directory"):
+        all_frames.append(read_quanta_mat(f, key=key))
+    all_frames = np.concatenate(all_frames, axis=0)
+
+    no_frames_total = meta.get("no_frames_total") if meta else None
+    if no_frames_total is not None and all_frames.shape[0] != int(no_frames_total):
+        logger.warning(
+            f"Metadata says no_frames_total={no_frames_total}, but read {all_frames.shape[0]} frames."
+        )
+    return all_frames
+
+
+def read_quanta_dir(path, H=512, W=512, key=None):
+    """
+    Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
+    array.
+
+    Two directory layouts are supported (detected automatically):
+
+    - **SPAD512 binary**: ``*.bin`` files; frame dimensions are given by ``H``, ``W``,
+      read in natural sorted order.
+    - **MATLAB volumes**: ``*.mat`` files, each a ``(H, W, T)`` volume, read in natural
+      sorted order (e.g. ``part2.mat`` before ``part10.mat``) and concatenated along T.
+      An optional ``info.json`` sidecar (with ``no_frames_total``, ``no_parts``,
+      ``no_frames``) is used to validate the result if present.
+
+    Args:
+        H, W (int): Height and width of the frames where it cannot be inferred (e.g.
+            SPAD512 .bin files). Ignored for .mat files, where they are inferred.
+        key (str or None): For .mat files, the variable/dataset name holding the volume.
+            If None, expects exactly one 3D array per file.
     """
     path = Path(path)
     if not path.is_dir():
         raise FileNotFoundError(f"Path {path} is not a directory")
-    try:
-        binpaths = sorted(path.glob("RAW*.bin"))
-        all_frames = []
-        for f in tqdm(binpaths, desc="Reading .bin files from directory"):
-            all_frames.append(read_quanta_bin(f, H=H, W=W))
-        all_frames = np.concatenate(all_frames, axis=0)
-        return all_frames
-    except ValueError as e:
-        logger.error("Error with reading likely due to MacOS dotfiles or other garbage. Run `dot_clean` in the directory to clean up dotfiles.")
-        raise e
+
+    binpaths = sorted(path.glob("*.bin"), key=lambda p: natural_sort_key(p.name))
+    if binpaths:
+        try:
+            all_frames = []
+            for f in tqdm(binpaths, desc="Reading .bin files from directory"):
+                all_frames.append(read_quanta_bin(f, H=H, W=W))
+            return np.concatenate(all_frames, axis=0)
+        except ValueError as e:
+            logger.error("Error with reading likely due to MacOS dotfiles or other garbage. Run `dot_clean` in the directory to clean up dotfiles.")
+            raise e
+
+    matpaths = sorted(path.glob("*.mat"), key=lambda p: natural_sort_key(p.name))
+    if matpaths:
+        return _read_quanta_mat_dir(path, matpaths, key=key)
+
+    raise FileNotFoundError(f"No *.bin or *.mat files found in {path}")
 
 
 def read_quanta_zarr(path, load_data=True):
@@ -408,10 +576,17 @@ def read_quanta_zarr(path, load_data=True):
     return frames, (t, y, x), dict(zarrdata.attrs)
 
 
-def read_quanta_auto(path, load_data=True, H=None, W=None):
+def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
     """
-    Automatically detects the format of the input path and reads the quanta data accordingly.
-    Priority: .zarr > .bin > directory of .bin files.
+    Automatically detects the format of the input path and reads the quanta data accordingly:
+    a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
+
+    Args:
+        load_data (bool): If True, load the data into memory. If False, returns lazy data if supported.
+        H, W (int): Height and width of the frames where it cannot be inferred (e.g. SPAD512 .bin files).
+            Otherwise, these are ignored and inferred from data.
+        key (str or None): For .mat inputs, the variable/dataset name holding the volume.
+            If None, expects exactly one 3D array per file.
 
     Returns:
         tuple:
@@ -419,29 +594,21 @@ def read_quanta_auto(path, load_data=True, H=None, W=None):
             - metadata (dict or None): relevant metadata if available, else None.
     """
     path = Path(path)
-    # first check if the path ends in .zarr, or if you append .zarr to the dir name it exists
     if path.suffix == ".zarr":
-        if path.is_dir():
-            logger.info(f"Reading quanta from Zarr file: {path}")
-            frames, _, metadata = read_quanta_zarr(path, load_data=load_data)
-            return frames, metadata
-    elif (path.parent / f"{path.name}.zarr").is_dir():
-        logger.info(f"Reading quanta from Zarr file: {path.parent / f'{path.name}.zarr'}")
-        frames, _, metadata = read_quanta_zarr(path.parent / f"{path.name}.zarr", load_data=load_data)
+        logger.info(f"Reading quanta from Zarr file: {path}")
+        frames, _, metadata = read_quanta_zarr(path, load_data=load_data)
         return frames, metadata
-    # check if the path ends in .bin, or if you append .bin to the name it exists
     elif path.suffix == ".bin":
-        if path.is_file():
-            logger.info(f"Reading quanta from binary file: {path}")
-            frames = read_quanta_bin(path, H=H, W=W)
-            return frames, None
-    elif (path.parent / f"{path.name}.bin").is_file():
-        logger.info(f"Reading quanta from binary file: {path.parent / f'{path.name}.bin'}")
-        frames = read_quanta_bin(path.parent / f"{path.name}.bin", H=H, W=W)
+        logger.info(f"Reading quanta from binary file: {path}")
+        frames = read_quanta_bin(path, H=H, W=W)
         return frames, None
-    # otherwise, assume it's a directory of .bin files
-    logger.info(f"Reading quanta from directory of binary files: {path}")
-    frames = read_quanta_dir(path, H=H, W=W)
+    elif path.suffix == ".mat":
+        logger.info(f"Reading quanta from MATLAB file: {path}")
+        frames = read_quanta_mat(path, key=key)
+        return frames, None
+    # otherwise, assume it's a directory of .bin or .mat files
+    logger.info(f"Reading quanta from directory of quanta files: {path}")
+    frames = read_quanta_dir(path, H=H, W=W, key=key)
     return frames, None
 
 
