@@ -6,6 +6,17 @@ throughout spadlib:
 - ``events``           : asynchronous continuous (t, y, x) event coordinates
 - ``pixel_timeseries`` : H x W list-of-lists of per-pixel timestamp arrays
 
+Readers and writers are named ``{read,write}_{data_kind}_{format}``, where the data
+kind is one of:
+
+- ``quanta``       : synchronous binary/count quanta frames
+- ``async_spad``   : asynchronous per-pixel photon timestamps
+- ``quanta_gated`` : gated quanta acquisitions, (n_frames, n_gate_steps, H, W)
+
+The representation names above (``frames``/``events``/``pixel_timeseries``) are used
+only by the format-conversion functions at the bottom of this module. Pre-convention
+names are kept as aliases at the end of the file.
+
 Also includes generic array <-> Zarr helpers used by the SPAD writers.
 """
 import json
@@ -215,12 +226,15 @@ def save_arr_to_zarr(
 # ---------------------------------------------------------------------------
 # SPAD writers
 # ---------------------------------------------------------------------------
-def write_pixel_timeseries_npys(pixel_timeseries, output_dir):
+def write_async_spad_npys(pixel_timeseries, output_dir):
     """
     Save a list of lists of pixel timeseries to .npy files, where pixel_timeseries[y][x] is an array of timestamps for that pixel.
     The files will be named with the pattern "scan_posX{X}_posY{Y}.npy" where {X} and {Y} are the pixel coordinates.
 
-    Originally pixel_timeseries_to_npys(pixel_timeseries, output_dir).
+    This is the write counterpart to :func:`read_async_spad_dir`.
+
+    Originally pixel_timeseries_to_npys(pixel_timeseries, output_dir), then
+    write_pixel_timeseries_npys(pixel_timeseries, output_dir).
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -232,11 +246,12 @@ def write_pixel_timeseries_npys(pixel_timeseries, output_dir):
                 pbar.update(1)
 
 
-def write_frames_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
+def write_quanta_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
     """
     Write binary quanta frames to a Zarr group.
 
-    Originally write_quantaframes_zarr(path, frames, T_exp, fps, save_coords).
+    Originally write_quantaframes_zarr(path, frames, T_exp, fps, save_coords), then
+    write_frames_zarr(path, frames, T_exp, fps, save_coords).
 
     Args:
         path (str or Path): Path to the output Zarr file.
@@ -316,9 +331,9 @@ def write_frames_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
     )
 
 
-def write_frames_gated_zarr(
+def write_quanta_gated_zarr(
     path,
-    gated_quanta,
+    quanta_gated,
     frames_per_chunk=None,
     max_chunk_bytes=MAX_CHUNK_BYTES,
     compressor=None,
@@ -338,8 +353,8 @@ def write_frames_gated_zarr(
 
     Args:
         path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
-        gated_quanta (GatedQuantaDir): the acquisition to write. This is the reader
-            object, not a path: build it with ``GatedQuantaDir(image_dir, ...)`` so the
+        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
+            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
             acquisition metadata is attached.
         frames_per_chunk (int or None): frames per chunk along the frame axis; if
             None, the largest number that keeps a chunk under `max_chunk_bytes`.
@@ -351,34 +366,34 @@ def write_frames_gated_zarr(
         overwrite (bool): if True, overwrite an existing zarr at `path`.
 
     Raises:
-        TypeError: if `gated_quanta` is not a :class:`GatedQuantaDir` (e.g. a path to
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
             the image directory was passed instead).
 
     Returns:
         The written zarr array.
     """
-    if not isinstance(gated_quanta, GatedQuantaDir):
-        if isinstance(gated_quanta, (str, Path)):
-            hint = f"GatedQuantaDir({str(gated_quanta)!r})"
+    if not isinstance(quanta_gated, QuantaGatedDir):
+        if isinstance(quanta_gated, (str, Path)):
+            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
         else:
-            hint = "GatedQuantaDir(image_dir, ...)"
+            hint = "QuantaGatedDir(image_dir, ...)"
         raise TypeError(
-            f"gated_quanta must be a GatedQuantaDir, not {type(gated_quanta).__name__}. "
+            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
             f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
             f"alongside the images."
         )
     path = Path(path)
-    n_frames, n_gate_steps, height, width = gated_quanta.shape
+    n_frames, n_gate_steps, height, width = quanta_gated.shape
     if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, gated_quanta.frame_nbytes, max_chunk_bytes)
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
     if compressor is None:
-        compressor = _default_compressor(gated_quanta.dtype)
+        compressor = _default_compressor(quanta_gated.dtype)
 
     def _create():
         return zarr.create_array(
             path,
             shape=(n_frames, n_gate_steps, height, width),
-            dtype=gated_quanta.dtype,
+            dtype=quanta_gated.dtype,
             chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
             compressors=compressor,
             overwrite=overwrite,
@@ -391,9 +406,9 @@ def write_frames_gated_zarr(
         ds = _create()
 
     ds_attrs = {
-        **gated_quanta.metadata,
+        **quanta_gated.metadata,
         "shape": "(n_frames, n_gate_steps, image_height, image_width)",
-        "source_dir": str(gated_quanta.path),
+        "source_dir": str(quanta_gated.path),
         **(attrs or {}),
     }
     for key, value in ds_attrs.items():
@@ -408,7 +423,7 @@ def write_frames_gated_zarr(
     def write_chunk(task):
         start, gate_idx = task
         frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
-        ds[frame_slice, gate_idx] = gated_quanta.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
@@ -764,6 +779,44 @@ def read_quanta_zarr(path, load_data=True):
     return frames, (t, y, x), dict(zarrdata.attrs)
 
 
+def read_quanta_gated_zarr(path, load_data=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
+    array (not a group).
+
+    Note that `load_data` defaults to False here, unlike the other zarr readers: a
+    gated acquisition is typically far too large to hold in memory (the reason it is
+    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place),
+    so the lazy zarr array is returned by default and sliced by the caller.
+
+    Args:
+        path (str or Path): path to the Zarr array.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy zarr array.
+
+    Returns:
+        tuple:
+            - frames: (n_frames, n_gate_steps, image_height, image_width) array,
+              lazy unless load_data=True.
+            - metadata (dict): the array attributes (acquisition metadata).
+    """
+    try:
+        ds = zarr.open_array(path, mode="r")
+    except zarr.errors.NodeTypeValidationError as e:
+        raise ValueError(
+            f"{path} is a Zarr group, not a Zarr array; gated quanta are written as a "
+            f"single array by write_quanta_gated_zarr. Use read_quanta_zarr for group-based "
+            f"quanta data."
+        ) from e
+    if ds.ndim != 4:
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"array, got shape {ds.shape}"
+        )
+    frames = ds[:] if load_data else ds
+    return frames, dict(ds.attrs)
+
+
 def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
     """
     Automatically detects the format of the input path and reads the quanta data accordingly:
@@ -803,7 +856,7 @@ def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
 # ---------------------------------------------------------------------------
 # Gated quanta (SPAD512 PNG sequences)
 # ---------------------------------------------------------------------------
-class GatedQuantaDir:
+class QuantaGatedDir:
     """
     Lazy, chunked access to a directory of SPAD512 gated quanta PNGs.
 
@@ -1176,3 +1229,14 @@ def frames_to_pixel_timeseries(frames, T_exp):
             pbar.update(1)
     pbar.close()
     return pixel_timeseries
+
+
+# ---------------------------------------------------------------------------
+# Pre-convention name aliases
+# ---------------------------------------------------------------------------
+# These point at the renamed functions above so existing code keeps working; prefer
+# the {read,write}_{quanta,async_spad,quanta_gated}_{format} names in new code.
+write_pixel_timeseries_npys = write_async_spad_npys
+write_frames_zarr = write_quanta_zarr
+write_frames_gated_zarr = write_quanta_gated_zarr
+read_frames_gated_zarr = read_quanta_gated_zarr
