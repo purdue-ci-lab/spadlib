@@ -36,6 +36,53 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Generic array <-> Zarr helpers
 # ---------------------------------------------------------------------------
+# Zarr recommends chunks of at least a few MB and no more than a few tens of MB;
+# used to cap how many frames go into one chunk along the frame axis.
+MAX_CHUNK_BYTES = 32_000_000
+
+
+def _frames_per_chunk(n_frames, frame_nbytes, max_chunk_bytes=MAX_CHUNK_BYTES):
+    """
+    Number of frames per chunk such that a chunk stays under `max_chunk_bytes`
+    (at least 1 frame, at most all of them).
+    """
+    return int(min(max(1, max_chunk_bytes // frame_nbytes), n_frames))
+
+
+def _write_arr_chunks(ds, arr, n_workers, desc):
+    """
+    Copy `arr` into the Zarr array `ds` one chunk at a time, using a thread pool.
+    """
+    # Generate slice tuples for all chunks
+    slices_list = []
+    for dim, chunk_size in zip(arr.shape, ds.chunks):
+        starts = list(range(0, dim, chunk_size))
+        slices_list.append(starts)
+
+    # Cartesian product over all chunk starts -> all chunk positions
+    chunk_starts = list(product(*slices_list))
+
+    def write_chunk(start_indices):
+        slc = tuple(
+            slice(start, min(start + cs, dim))
+            for start, cs, dim in zip(start_indices, ds.chunks, arr.shape)
+        )
+        ds[slc] = arr[slc]
+
+    # Write chunks concurrently
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        list(tqdm(executor.map(write_chunk, chunk_starts), total=len(chunk_starts), desc=desc))
+
+
+def _default_compressor(dtype):
+    """
+    Blosc/zstd codec, bitshuffled for single-byte dtypes (binary/8-bit quanta data).
+    """
+    if np.dtype(dtype).itemsize == 1:
+        return zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+    return zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")
+
+
 def save_arrs_to_zarr(
     data_dict,
     zarr_path,
@@ -71,10 +118,7 @@ def save_arrs_to_zarr(
         compressor_dict = {}
         for key, arr in data_dict.items():
             # if it's uint8 or boolean, use bitshuffle; otherwise, use shuffle
-            if arr.itemsize == 1:
-                compressor_dict[key] = zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-            else:
-                compressor_dict[key] = zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="shuffle")
+            compressor_dict[key] = _default_compressor(arr.dtype)
     if chunks is None:
         chunks = {}
 
@@ -100,28 +144,72 @@ def save_arrs_to_zarr(
             compressors=ds_compressor,
             overwrite=True
         )
-
-        # Generate slice tuples for all chunks
-        slices_list = []
-        for dim, chunk_size in zip(arr.shape, ds.chunks):
-            starts = list(range(0, dim, chunk_size))
-            slices_list.append(starts)
-
-        # Cartesian product over all chunk starts -> all chunk positions
-        chunk_starts = list(product(*slices_list))
-
-        def write_chunk(start_indices):
-            slc = tuple(
-                slice(start, min(start + cs, dim))
-                for start, cs, dim in zip(start_indices, ds.chunks, arr.shape)
-            )
-            ds[slc] = arr[slc]
-
-        # Write chunks concurrently
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            list(tqdm(executor.map(write_chunk, chunk_starts), total=len(chunk_starts), desc=f"Writing {key}"))
+        _write_arr_chunks(ds, arr, n_workers, desc=f"Writing {key}")
     logger.info(f"Saved arrays to Zarr at: {zarr_path}")
     return root  # return the zarr group (useful for immediate reading)
+
+
+def save_arr_to_zarr(
+    arr,
+    zarr_path,
+    chunks=None,
+    attrs=None,
+    compressor=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Save a single numpy array to a Zarr array (not a group) concurrently.
+
+    Same threaded chunk-by-chunk writing as :func:`save_arrs_to_zarr`, but the store
+    at `zarr_path` holds the array itself rather than a group of named arrays.
+
+    Args:
+        arr : numpy array
+            Array to save.
+        zarr_path : path-like
+            Path to output Zarr directory (e.g., "frames.zarr").
+        chunks : tuple or None
+            Chunk shape; if None, zarr picks automatically.
+        attrs : dict or None
+            Attribute metadata to set on the Zarr array.
+        compressor : codec or None
+            Codec for compression (default: bitshuffle for 1-byte dtypes, else shuffle).
+        n_workers : int
+            Number of worker threads to write the array concurrently.
+        overwrite : bool
+            If True, overwrite an existing zarr at zarr_path.
+    """
+    zarr_path = Path(zarr_path)
+    arr = np.asarray(arr)
+    if compressor is None:
+        compressor = _default_compressor(arr.dtype)
+    if chunks is None:
+        chunks = "auto"
+
+    def _create():
+        return zarr.create_array(
+            zarr_path,
+            shape=arr.shape,
+            dtype=arr.dtype,
+            chunks=chunks,
+            compressors=compressor,
+            overwrite=overwrite,
+        )
+
+    try:
+        ds = _create()
+    except FileNotFoundError:
+        dot_clean_dir(zarr_path)
+        ds = _create()
+
+    if attrs is not None:
+        for key, value in attrs.items():
+            ds.attrs[key] = make_json_serializable(value)
+
+    _write_arr_chunks(ds, arr, n_workers, desc=f"Writing {zarr_path.name}")
+    logger.info(f"Saved array to Zarr at: {zarr_path}")
+    return ds  # return the zarr array (useful for immediate reading)
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +314,106 @@ def write_frames_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
         },
         compressor_dict=compressors,
     )
+
+
+def write_frames_gated_zarr(
+    path,
+    gated_quanta,
+    frames_per_chunk=None,
+    max_chunk_bytes=MAX_CHUNK_BYTES,
+    compressor=None,
+    attrs=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to a single Zarr array (not a group) of shape
+    (n_frames, n_gate_steps, image_height, image_width), with the acquisition
+    metadata stored as array attributes.
+
+    Images are read and written chunk-by-chunk, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
+    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
+    summing over frames) touch whole chunks.
+
+    Args:
+        path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
+        gated_quanta (GatedQuantaDir): the acquisition to write. This is the reader
+            object, not a path: build it with ``GatedQuantaDir(image_dir, ...)`` so the
+            acquisition metadata is attached.
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        compressor (codec or None): codec for compression (default: bitshuffle for
+            8-bit data, else shuffle).
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        n_workers (int): number of worker threads reading/writing chunks concurrently.
+        overwrite (bool): if True, overwrite an existing zarr at `path`.
+
+    Raises:
+        TypeError: if `gated_quanta` is not a :class:`GatedQuantaDir` (e.g. a path to
+            the image directory was passed instead).
+
+    Returns:
+        The written zarr array.
+    """
+    if not isinstance(gated_quanta, GatedQuantaDir):
+        if isinstance(gated_quanta, (str, Path)):
+            hint = f"GatedQuantaDir({str(gated_quanta)!r})"
+        else:
+            hint = "GatedQuantaDir(image_dir, ...)"
+        raise TypeError(
+            f"gated_quanta must be a GatedQuantaDir, not {type(gated_quanta).__name__}. "
+            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
+            f"alongside the images."
+        )
+    path = Path(path)
+    n_frames, n_gate_steps, height, width = gated_quanta.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, gated_quanta.frame_nbytes, max_chunk_bytes)
+    if compressor is None:
+        compressor = _default_compressor(gated_quanta.dtype)
+
+    def _create():
+        return zarr.create_array(
+            path,
+            shape=(n_frames, n_gate_steps, height, width),
+            dtype=gated_quanta.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            compressors=compressor,
+            overwrite=overwrite,
+        )
+
+    try:
+        ds = _create()
+    except FileNotFoundError:
+        dot_clean_dir(path)
+        ds = _create()
+
+    ds_attrs = {
+        **gated_quanta.metadata,
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+        "source_dir": str(gated_quanta.path),
+        **(attrs or {}),
+    }
+    for key, value in ds_attrs.items():
+        ds.attrs[key] = make_json_serializable(value)
+
+    tasks = [
+        (start, gate_idx)
+        for gate_idx in range(n_gate_steps)
+        for start in range(0, n_frames, frames_per_chunk)
+    ]
+
+    def write_chunk(task):
+        start, gate_idx = task
+        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
+        ds[frame_slice, gate_idx] = gated_quanta.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
+    logger.info(f"Saved gated quanta to Zarr at: {path}")
+    return ds
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +798,228 @@ def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
     logger.info(f"Reading quanta from directory of quanta files: {path}")
     frames = read_quanta_dir(path, H=H, W=W, key=key)
     return frames, None
+
+
+# ---------------------------------------------------------------------------
+# Gated quanta (SPAD512 PNG sequences)
+# ---------------------------------------------------------------------------
+class GatedQuantaDir:
+    """
+    Lazy, chunked access to a directory of SPAD512 gated quanta PNGs.
+
+    The acquisition is a (n_frames, n_gate_steps) grid of images named
+    ``IMG{frame:05d}-{gate_step:04d}.png`` (case-insensitive extension). Since a
+    single acquisition can be hundreds of thousands of images, nothing is read at
+    construction beyond the file listing and the first image (for geometry/dtype);
+    pixel data is only read when streamed or requested block-by-block.
+
+    The SPAD512 software is documented to embed acquisition metadata in the PNGs,
+    but it is not present in practice, so the relevant fields may instead be passed
+    in here. ``n_frames``, ``n_gate_steps``, ``image_width`` and ``image_bit_depth``
+    are always inferred from the files; if also given explicitly, a mismatch is
+    logged as a warning (the inferred value wins).
+
+    Args:
+        path (str or Path): directory of ``IMG*-*.png`` files.
+        image_bit_depth (int or None): bits per pixel of the acquisition (8 or 16;
+            may be less than the storage depth, e.g. 12-bit data in 16-bit PNGs).
+        image_width (int or None): image width in pixels.
+        integration_time_ms (float or None): integration time per frame, in ms.
+        laser_frequency (float or None): laser repetition frequency.
+        n_frames (int or None): number of frames per gate step.
+        n_gate_steps (int or None): number of gate steps.
+        gate_step_size_ps (float or None): gate step size, in ps.
+        gate_width_ns (float or None): gate width, in ns.
+        gate_offset_ps (float or None): gate offset, in ps.
+
+    Attributes:
+        n_frames, n_gate_steps, image_height, image_width (int): grid/image geometry.
+        dtype (np.dtype): storage dtype of the PNGs (uint8 or uint16).
+    """
+    FILENAME_RE = re.compile(r"IMG(\d+)-(\d+)\.png$", re.IGNORECASE)
+
+    def __init__(
+        self,
+        path,
+        image_bit_depth=None,
+        image_width=None,
+        integration_time_ms=None,
+        laser_frequency=None,
+        n_frames=None,
+        n_gate_steps=None,
+        gate_step_size_ps=None,
+        gate_width_ns=None,
+        gate_offset_ps=None,
+    ):
+        self.path = Path(path)
+        if not self.path.is_dir():
+            raise FileNotFoundError(f"Path {self.path} is not a directory")
+
+        parsed = []
+        for f in sorted(self.path.iterdir(), key=lambda p: natural_sort_key(p.name)):
+            m = self.FILENAME_RE.match(f.name)
+            if m is not None:
+                parsed.append((int(m.group(1)), int(m.group(2)), f))
+        if not parsed:
+            raise FileNotFoundError(f"No IMG*-*.png files found in {self.path}")
+
+        self.n_frames = max(p[0] for p in parsed) + 1
+        self.n_gate_steps = max(p[1] for p in parsed) + 1
+        self._check_metadata("n_frames", n_frames, self.n_frames)
+        self._check_metadata("n_gate_steps", n_gate_steps, self.n_gate_steps)
+
+        # (n_frames, n_gate_steps) grid of file paths; None where a file is missing
+        self._paths = np.empty((self.n_frames, self.n_gate_steps), dtype=object)
+        for frame_idx, gate_idx, f in parsed:
+            self._paths[frame_idx, gate_idx] = f
+        n_missing = self.n_frames * self.n_gate_steps - len(parsed)
+        if n_missing:
+            logger.warning(
+                f"{self.path.name}: {n_missing} of {self.n_frames * self.n_gate_steps} "
+                f"images are missing; they will read back as zeros."
+            )
+
+        first = cv2.imread(str(parsed[0][2]), cv2.IMREAD_UNCHANGED)
+        if first is None:
+            raise IOError(f"cv2 failed to read {parsed[0][2]}")
+        self.image_height, self.image_width = first.shape[:2]
+        self.dtype = first.dtype
+        self._check_metadata("image_width", image_width, self.image_width)
+
+        storage_bit_depth = self.dtype.itemsize * 8
+        if image_bit_depth is not None and image_bit_depth > storage_bit_depth:
+            logger.warning(
+                f"{self.path.name}: image_bit_depth={image_bit_depth} exceeds the "
+                f"{storage_bit_depth}-bit PNG storage depth."
+            )
+        self.image_bit_depth = image_bit_depth if image_bit_depth is not None else storage_bit_depth
+
+        self.integration_time_ms = integration_time_ms
+        self.laser_frequency = laser_frequency
+        self.gate_step_size_ps = gate_step_size_ps
+        self.gate_width_ns = gate_width_ns
+        self.gate_offset_ps = gate_offset_ps
+
+        logger.info(
+            f"Found {len(parsed)} images in {self.path}: "
+            f"{self.n_frames} frames x {self.n_gate_steps} gate steps "
+            f"({self.image_height} x {self.image_width}, {self.dtype})"
+        )
+
+    def _check_metadata(self, name, given, found):
+        if given is not None and int(given) != found:
+            logger.warning(f"{self.path.name}: {name}={given} was given, but found {found} in the files.")
+
+    def __len__(self):
+        return self.n_frames
+
+    def __repr__(self):
+        return (
+            f"{type(self).__name__}({self.path.name!r}, n_frames={self.n_frames}, "
+            f"n_gate_steps={self.n_gate_steps}, image_height={self.image_height}, "
+            f"image_width={self.image_width}, dtype={self.dtype})"
+        )
+
+    @property
+    def shape(self):
+        """(n_frames, n_gate_steps, image_height, image_width)"""
+        return (self.n_frames, self.n_gate_steps, self.image_height, self.image_width)
+
+    @property
+    def frame_nbytes(self):
+        """Size of a single decoded image in bytes."""
+        return self.image_height * self.image_width * self.dtype.itemsize
+
+    @property
+    def metadata(self):
+        """
+        Acquisition metadata as a dict, omitting fields that were never provided.
+        """
+        meta = {
+            "n_frames": self.n_frames,
+            "n_gate_steps": self.n_gate_steps,
+            "image_height": self.image_height,
+            "image_width": self.image_width,
+            "image_bit_depth": self.image_bit_depth,
+            "integration_time_ms": self.integration_time_ms,
+            "laser_frequency": self.laser_frequency,
+            "gate_step_size_ps": self.gate_step_size_ps,
+            "gate_width_ns": self.gate_width_ns,
+            "gate_offset_ps": self.gate_offset_ps,
+        }
+        return {k: v for k, v in meta.items() if v is not None}
+
+    def read_image(self, frame_idx, gate_idx):
+        """
+        Read a single (image_height, image_width) image. Missing files read as zeros.
+        """
+        fpath = self._paths[frame_idx, gate_idx]
+        if fpath is None:
+            return np.zeros((self.image_height, self.image_width), dtype=self.dtype)
+        img = cv2.imread(str(fpath), cv2.IMREAD_UNCHANGED)  # native dtype, no BGR conversion
+        if img is None:
+            raise IOError(f"cv2 failed to read {fpath}")
+        return img
+
+    def read_block(self, frames=None, gate_steps=None):
+        """
+        Read a block of images into memory as a
+        (n_frames_in_block, n_gate_steps_in_block, image_height, image_width) array.
+
+        Args:
+            frames (slice or None): frames to read (default: all).
+            gate_steps (slice or None): gate steps to read (default: all).
+        """
+        frames = slice(None) if frames is None else frames
+        gate_steps = slice(None) if gate_steps is None else gate_steps
+        frame_idxs = range(*frames.indices(self.n_frames))
+        gate_idxs = range(*gate_steps.indices(self.n_gate_steps))
+        block = np.zeros(
+            (len(frame_idxs), len(gate_idxs), self.image_height, self.image_width),
+            dtype=self.dtype,
+        )
+        for i, frame_idx in enumerate(frame_idxs):
+            for j, gate_idx in enumerate(gate_idxs):
+                block[i, j] = self.read_image(frame_idx, gate_idx)
+        return block
+
+    def stream(self, progress=True):
+        """
+        Yield ``(frame_idx, gate_idx, image)`` one image at a time, in frame-major
+        order, holding only one image in memory at a time. Missing files are skipped.
+        """
+        pairs = [
+            (frame_idx, gate_idx)
+            for frame_idx in range(self.n_frames)
+            for gate_idx in range(self.n_gate_steps)
+            if self._paths[frame_idx, gate_idx] is not None
+        ]
+        for frame_idx, gate_idx in tqdm(pairs, desc="Streaming gated frames", disable=not progress):
+            yield frame_idx, gate_idx, self.read_image(frame_idx, gate_idx)
+
+    def iter_chunks(self, frames_per_chunk=None, max_chunk_bytes=MAX_CHUNK_BYTES, progress=True):
+        """
+        Yield ``(frame_slice, gate_idx, block)`` for one gate step at a time, in
+        blocks of at most `frames_per_chunk` frames. `block` has shape
+        (n_frames_in_chunk, image_height, image_width).
+
+        Args:
+            frames_per_chunk (int or None): frames per chunk; if None, the largest
+                number that keeps a chunk under `max_chunk_bytes`.
+            max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+            progress (bool): show a progress bar over chunks.
+        """
+        if frames_per_chunk is None:
+            frames_per_chunk = _frames_per_chunk(self.n_frames, self.frame_nbytes, max_chunk_bytes)
+        starts = [
+            (start, gate_idx)
+            for gate_idx in range(self.n_gate_steps)
+            for start in range(0, self.n_frames, frames_per_chunk)
+        ]
+        for start, gate_idx in tqdm(starts, desc="Reading gated chunks", disable=not progress):
+            stop = min(start + frames_per_chunk, self.n_frames)
+            frame_slice = slice(start, stop)
+            yield frame_slice, gate_idx, self.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
 
 
 # ---------------------------------------------------------------------------

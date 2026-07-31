@@ -4,10 +4,12 @@ sorting, number formatting, and colormap conversions.
 """
 import atexit
 import json
+import logging
 import math
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import weakref
 from pathlib import Path
@@ -16,12 +18,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+logger = logging.getLogger(__name__)
+
+
 def dot_clean_dir(path):
     """
     Run macOS `dot_clean` on a directory to remove `._*` AppleDouble dotfiles,
-    which otherwise corrupt readers that glob a directory (e.g. Zarr stores).
+    or things like .DS_store, which otherwise corrupt readers that glob a
+    directory (e.g. Zarr stores).
+
+    `dot_clean` only exists on macOS; on other platforms this is a no-op that
+    returns None (no equivalent cleanup is performed yet).
     """
     path = Path(path)
+    if sys.platform != "darwin":
+        logger.debug(f"Skipping dot_clean on {path}: not available on platform {sys.platform!r}.")
+        return None
     result = subprocess.run(
         ["dot_clean", "-mn", str(path.absolute())],
         capture_output=True, text=True, check=True
