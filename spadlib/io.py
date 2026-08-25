@@ -246,6 +246,105 @@ def write_async_spad_npys(pixel_timeseries, output_dir):
                 pbar.update(1)
 
 
+def write_async_spad_zarr(
+    path,
+    pixel_timeseries,
+    T_exp,
+    points=None,
+    attrs=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Write asynchronous SPAD data (per-pixel photon timestamps) to a Zarr group.
+
+    The per-pixel arrays are flattened into a single ``timestamps`` array in row-major
+    pixel order, indexed by ``offsets``/``lengths`` of shape (H, W), so pixel (i, j) is
+    ``timestamps[offsets[i, j]:offsets[i, j] + lengths[i, j]]``. The flat event
+    coordinates are also stored as ``t``/``y``/``x``.
+
+    This is the write counterpart to :func:`read_async_spad_zarr`.
+
+    Args:
+        path (str or Path): path to the output Zarr group (e.g. "G.zarr").
+        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
+            arrays, as returned by :func:`read_async_spad_dir`. ``None`` entries are
+            treated as pixels with no photons.
+        T_exp (float): exposure/acquisition time in seconds, used for the per-pixel
+            photon rate statistics.
+        points (np.ndarray or None): (N, 3) array of [t, y, x] event coordinates, as
+            returned by :func:`read_async_spad_dir`. If None, they are rebuilt from
+            `pixel_timeseries` (in row-major pixel order, with unnormalized y/x).
+        attrs (dict or None): extra attributes, merged over the computed metadata.
+        n_workers (int): number of worker threads writing arrays concurrently.
+        overwrite (bool): if True, overwrite an existing zarr at `path`.
+
+    Returns:
+        The written zarr group.
+    """
+    H = len(pixel_timeseries)
+    W = len(pixel_timeseries[0])
+    if any(len(row) != W for row in pixel_timeseries):
+        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
+
+    lengths = np.zeros((H, W), dtype="int64")
+    flat_list = []
+    for i in range(H):
+        for j in range(W):
+            arr = pixel_timeseries[i][j]
+            arr = np.asarray([] if arr is None else arr, dtype="float64")
+            lengths[i, j] = arr.size
+            flat_list.append(arr)
+    # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
+    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
+    timestamps = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
+
+    if points is None:
+        ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+        t = timestamps
+        y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
+        x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
+    else:
+        points = np.asarray(points)
+        t, y, x = points[:, 0], points[:, 1], points[:, 2]
+
+    pixel_photon_rates = lengths / T_exp
+    data = {
+        "timestamps": timestamps,
+        "offsets": offsets,
+        "lengths": lengths,
+        "t": t,
+        "y": y,
+        "x": x,
+    }
+    # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
+    chunks = {
+        # max(1, ...) so a dataset with no photons still gets a valid chunk shape
+        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
+        for key in ("timestamps", "t", "y", "x")
+    }
+    metadata = {
+        "T_exp": T_exp,
+        "H": H,
+        "W": W,
+        "shape": "(H, W)",
+        "npoints": int(t.size),
+        "avg_pts_persec_perpixel": np.mean(pixel_photon_rates),
+        "max_pts_persec_perpixel": np.max(pixel_photon_rates),
+        "min_pts_persec_perpixel": np.min(pixel_photon_rates),
+        "med_pts_persec_perpixel": np.median(pixel_photon_rates),
+        "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
+        **(attrs or {}),
+    }
+    return save_arrs_to_zarr(
+        data, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=overwrite,
+        attrs=metadata,
+    )
+
+
 def write_quanta_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
     """
     Write binary quanta frames to a Zarr group.
