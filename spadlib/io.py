@@ -23,7 +23,7 @@ import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
-from itertools import product
+from itertools import accumulate, product
 from pathlib import Path
 import warnings
 
@@ -621,34 +621,173 @@ def read_async_spad_zarr(path, load_data=True):
     return (t, y, x), pixel_timeseries, root.attrs
 
 
-def read_quanta_bin(path, H=512, W=512):
+class LazyQuantaFrames:
     """
-    Read a single binary SPAD512 file.
+    Lazy ``(T, H, W)`` quanta frames backed by one or more ``.bin``/``.mat`` files,
+    concatenated along T in the given order. Returned by the ``.bin``/``.mat``/directory
+    quanta readers when ``load_data=False``.
+
+    Only file sizes/headers are read at construction. Frames are read from disk when
+    indexed, and only from the files the index touches. SPAD512 ``.bin`` and MATLAB v7.3
+    (HDF5) files are read partially; MATLAB v7/v7.2 files can only be loaded whole, so
+    each index that touches one loads that entire file.
+
+    Only integer and slice indexing (optionally with ``...``) is supported, with numpy
+    semantics; the result is a numpy array.
+
+    Args:
+        files: ``_QuantaBinFile``/``_QuantaMatFile`` objects, all with the same frame shape.
+    """
+
+    def __init__(self, files):
+        self._files = list(files)
+        frame_shapes = {f.shape[1:] for f in self._files}
+        if len(frame_shapes) != 1:
+            raise ValueError(f"Files have mismatched frame shapes: {sorted(frame_shapes)}")
+        # index of the first frame of each file within the concatenated frames
+        self._starts = [0, *accumulate(f.n_frames for f in self._files)]
+        self.shape = (self._starts[-1], *frame_shapes.pop())
+        self.dtype = np.result_type(*(f.dtype for f in self._files))
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __repr__(self):
+        return f"{type(self).__name__}(n_files={len(self._files)}, shape={self.shape}, dtype={self.dtype})"
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        for k in key:
+            if not (k is Ellipsis or isinstance(k, slice) or (isinstance(k, (int, np.integer)) and not isinstance(k, bool))):
+                raise TypeError(f"{type(self).__name__} only supports integer and slice indexing, got {k!r}")
+        n_ellipsis = sum(k is Ellipsis for k in key)
+        if n_ellipsis > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        if n_ellipsis:
+            i = next(i for i, k in enumerate(key) if k is Ellipsis)
+            key = key[:i] + (slice(None),) * (self.ndim - len(key) + 1) + key[i + 1:]
+        if len(key) > self.ndim:
+            raise IndexError(f"too many indices for array: array is {self.ndim}-dimensional, but {len(key)} were indexed")
+        spatial_key = (slice(None), *key[1:])
+
+        t_idx = range(self.shape[0])[key[0]]  # int (IndexError if out of range) or range
+        is_int = not isinstance(t_idx, range)
+        t_range = range(t_idx, t_idx + 1) if is_int else t_idx
+        # read in increasing frame order, then flip back
+        reverse = t_range.step < 0
+        if reverse:
+            t_range = t_range[::-1]
+
+        pieces = []
+        for f, start in zip(self._files, self._starts):
+            # the elements of t_range that fall within this file
+            lo = max(0, -(-(start - t_range.start) // t_range.step))
+            hi = max(0, -(-(start + f.n_frames - t_range.start) // t_range.step))
+            sub = t_range[lo:hi]
+            if sub:
+                sel = slice(sub[0] - start, sub[-1] - start + 1, sub.step)
+                pieces.append(f.read(sel)[spatial_key])
+
+        if not pieces:
+            frames = np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key]
+        elif len(pieces) == 1:
+            frames = pieces[0]
+        else:
+            frames = np.concatenate(pieces, axis=0)
+        if reverse:
+            frames = frames[::-1]
+        if not is_int:
+            return frames
+        # like numpy, an all-integer index with an ellipsis gives a 0-d array, not a scalar
+        return frames[0, ...] if n_ellipsis else frames[0]
+
+
+class _QuantaBinFile:
+    """
+    A single SPAD512 packed-bits ``.bin`` file, read as ``(T, W, H)`` frames on demand.
 
     Ripped from spadtools (https://github.com/lyehe/spadtools).
     """
-    if H is None:
-        H = 512
-    if W is None:
-        W = 512
-    with open(path, "rb") as f:
-        raw_data = f.read()
-    binframe_length = H * W // 8
-    frame_count = len(raw_data) // binframe_length
-    bits_array = np.frombuffer(raw_data, dtype=np.uint8).reshape(
-        frame_count, H, W // 8
-    )
 
-    frames = np.unpackbits(bits_array, axis=2)
-    frames = np.rot90(frames, k=1, axes=(1, 2))
-    return frames
+    def __init__(self, path, H=512, W=512):
+        self.path = Path(path)
+        self.H = 512 if H is None else H
+        self.W = 512 if W is None else W
+        self._frame_nbytes = self.H * self.W // 8
+        nbytes = self.path.stat().st_size
+        if nbytes % self._frame_nbytes:
+            raise ValueError(
+                f"{self.path.name}: file size ({nbytes} bytes) is not a multiple of the "
+                f"frame size ({self._frame_nbytes} bytes for H={self.H}, W={self.W})"
+            )
+        self.n_frames = nbytes // self._frame_nbytes
+        self.shape = (self.n_frames, self.W, self.H)  # rot90 on read swaps H and W
+        self.dtype = np.dtype(np.uint8)
+
+    def read(self, sel=slice(None)):
+        """Read the frames selected by `sel` (a slice with positive step)."""
+        start, stop, step = sel.indices(self.n_frames)
+        with open(self.path, "rb") as f:
+            f.seek(start * self._frame_nbytes)
+            raw_data = f.read(max(stop - start, 0) * self._frame_nbytes)
+        bits_array = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, self.H, self.W // 8)[::step]
+        frames = np.unpackbits(bits_array, axis=2)
+        return np.rot90(frames, k=1, axes=(1, 2))
 
 
-def _load_mat_array(mat_path, key=None):
+class _QuantaMatFile:
     """
-    Load a single 3D array from a MATLAB ``.mat`` file, as stored (``(H, W, T)``).
+    A single MATLAB ``.mat`` quanta volume stored as ``(H, W, T)``, read as ``(T, H, W)``
+    frames on demand. Only the variable's shape and dtype are read at construction.
+    """
 
-    Supports both MATLAB v7/v7.2 files (via ``scipy.io.loadmat``) and v7.3 HDF5-based
+    def __init__(self, path, key=None):
+        self.path = Path(path)
+        self.key, shape, dtype, self._is_hdf5 = _inspect_mat_array(self.path, key=key)
+        if len(shape) != 3:
+            raise ValueError(f"{self.path.name}: expected 3D array, got shape {shape}")
+        self.n_frames = shape[2]
+        self.shape = (shape[2], shape[0], shape[1])
+        self.dtype = np.dtype(dtype)
+
+    def read(self, sel=slice(None)):
+        """Read the frames selected by `sel` (a slice with positive step)."""
+        if self._is_hdf5:
+            import h5py
+            with h5py.File(self.path.as_posix(), "r") as f:
+                arr = f[self.key][:, :, sel]  # only reads the selected frames
+        else:
+            import scipy.io
+            arr = scipy.io.loadmat(self.path.as_posix(), variable_names=[self.key])[self.key][:, :, sel]
+        # (H, W, T) -> (T, H, W)
+        return np.transpose(arr, (2, 0, 1))
+
+
+def read_quanta_bin(path, H=512, W=512, load_data=True):
+    """
+    Read a single binary SPAD512 file.
+
+    Args:
+        load_data (bool): if True, read the whole file into memory as a numpy array. If
+            False, return a :class:`LazyQuantaFrames` that reads frames when indexed.
+
+    Ripped from spadtools (https://github.com/lyehe/spadtools).
+    """
+    frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
+    return frames[:] if load_data else frames
+
+
+def _inspect_mat_array(mat_path, key=None):
+    """
+    Find the array to read from a MATLAB ``.mat`` file and get its stored shape and
+    dtype, without loading its data.
+
+    Supports both MATLAB v7/v7.2 files (via ``scipy.io.whosmat``) and v7.3 HDF5-based
     files (via ``h5py``, imported lazily so it is only required for v7.3 data).
 
     Args:
@@ -656,6 +795,9 @@ def _load_mat_array(mat_path, key=None):
         key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
             array. If None, expects exactly one 3D array (v7.3) or one non-reserved
             variable (v7/v7.2) in the file.
+
+    Returns:
+        tuple: (key, shape, dtype, is_hdf5)
     """
     mat_path = Path(mat_path)
 
@@ -663,8 +805,8 @@ def _load_mat_array(mat_path, key=None):
     scipy_error = None
     try:
         import scipy.io
-        d = scipy.io.loadmat(mat_path.as_posix())
-        candidates = [k for k in d.keys() if not k.startswith("__")]
+        variables = {name: (shape, cls) for name, shape, cls in scipy.io.whosmat(mat_path.as_posix())}
+        candidates = list(variables)
         if not candidates:
             raise ValueError(f"No array variables found in {mat_path.name}")
         if key is None:
@@ -675,10 +817,12 @@ def _load_mat_array(mat_path, key=None):
                 )
             key_use = candidates[0]
         else:
-            if key not in d:
+            if key not in variables:
                 raise KeyError(f"{mat_path.name}: key '{key}' not found. Available: {candidates}")
             key_use = key
-        return np.asarray(d[key_use])
+        shape, cls = variables[key_use]
+        # MATLAB class names match numpy dtype names, except logical (loaded as uint8)
+        return key_use, shape, np.dtype(np.uint8 if cls == "logical" else cls), False
     except NotImplementedError:
         pass  # v7.3 file; fall through to h5py
     except Exception as e:
@@ -708,7 +852,8 @@ def _load_mat_array(mat_path, key=None):
                 key_use = key
                 if key_use not in f:
                     raise KeyError(f"{mat_path.name}: dataset '{key_use}' not found in v7.3 file.")
-            return np.array(f[key_use])  # loads this part into RAM (one .mat at a time)
+            ds = f[key_use]
+            return key_use, ds.shape, ds.dtype, True
     except Exception as e:
         if scipy_error is not None:
             raise RuntimeError(
@@ -717,7 +862,7 @@ def _load_mat_array(mat_path, key=None):
         raise
 
 
-def read_quanta_mat(path, key=None):
+def read_quanta_mat(path, key=None, load_data=True):
     """
     Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
     (consistent with :func:`read_quanta_bin`).
@@ -729,12 +874,11 @@ def read_quanta_mat(path, key=None):
         path (str or Path): Path to the .mat file.
         key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
             volume. If None, expects exactly one 3D array in the file.
+        load_data (bool): if True, read the whole volume into memory as a numpy array. If
+            False, return a :class:`LazyQuantaFrames` that reads frames when indexed.
     """
-    arr = _load_mat_array(path, key=key)
-    if arr.ndim != 3:
-        raise ValueError(f"{Path(path).name}: expected 3D array, got shape {arr.shape}")
-    # (H, W, T) -> (T, H, W)
-    return np.transpose(arr, (2, 0, 1))
+    frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
+    return frames[:] if load_data else frames
 
 
 def _read_mat_meta(path):
@@ -762,7 +906,7 @@ def _read_mat_meta(path):
         return None
 
 
-def _read_quanta_mat_dir(path, matpaths, key=None):
+def _read_quanta_mat_dir(path, matpaths, key=None, load_data=True):
     """
     Read and concatenate a directory of MATLAB ``.mat`` quanta volumes into ``(T, H, W)``.
 
@@ -775,20 +919,20 @@ def _read_quanta_mat_dir(path, matpaths, key=None):
     if no_parts is not None and len(matpaths) != int(no_parts):
         logger.warning(f"Metadata says no_parts={no_parts}, but found {len(matpaths)} .mat files.")
 
-    all_frames = []
-    for f in tqdm(matpaths, desc="Reading .mat files from directory"):
-        all_frames.append(read_quanta_mat(f, key=key))
-    all_frames = np.concatenate(all_frames, axis=0)
+    files = [_QuantaMatFile(f, key=key) for f in matpaths]
+    frames = LazyQuantaFrames(files)
 
     no_frames_total = meta.get("no_frames_total") if meta else None
-    if no_frames_total is not None and all_frames.shape[0] != int(no_frames_total):
+    if no_frames_total is not None and frames.shape[0] != int(no_frames_total):
         logger.warning(
-            f"Metadata says no_frames_total={no_frames_total}, but read {all_frames.shape[0]} frames."
+            f"Metadata says no_frames_total={no_frames_total}, but found {frames.shape[0]} frames."
         )
-    return all_frames
+    if not load_data:
+        return frames
+    return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
 
 
-def read_quanta_dir(path, H=512, W=512, key=None):
+def read_quanta_dir(path, H=512, W=512, key=None, load_data=True):
     """
     Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
     array.
@@ -807,6 +951,9 @@ def read_quanta_dir(path, H=512, W=512, key=None):
             SPAD512 .bin files). Ignored for .mat files, where they are inferred.
         key (str or None): For .mat files, the variable/dataset name holding the volume.
             If None, expects exactly one 3D array per file.
+        load_data (bool): if True, read all files into memory as a numpy array. If False,
+            return a :class:`LazyQuantaFrames` over all files that reads frames when
+            indexed.
     """
     path = Path(path)
     if not path.is_dir():
@@ -815,17 +962,18 @@ def read_quanta_dir(path, H=512, W=512, key=None):
     binpaths = sorted(path.glob("*.bin"), key=lambda p: natural_sort_key(p.name))
     if binpaths:
         try:
-            all_frames = []
-            for f in tqdm(binpaths, desc="Reading .bin files from directory"):
-                all_frames.append(read_quanta_bin(f, H=H, W=W))
-            return np.concatenate(all_frames, axis=0)
+            files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
+            frames = LazyQuantaFrames(files)
         except ValueError as e:
             logger.error("Error with reading likely due to MacOS dotfiles or other garbage. Run `dot_clean` in the directory to clean up dotfiles.")
             raise e
+        if not load_data:
+            return frames
+        return np.concatenate([f.read() for f in tqdm(files, desc="Reading .bin files from directory")], axis=0)
 
     matpaths = sorted(path.glob("*.mat"), key=lambda p: natural_sort_key(p.name))
     if matpaths:
-        return _read_quanta_mat_dir(path, matpaths, key=key)
+        return _read_quanta_mat_dir(path, matpaths, key=key, load_data=load_data)
 
     raise FileNotFoundError(f"No *.bin or *.mat files found in {path}")
 
@@ -940,15 +1088,15 @@ def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
         return frames, metadata
     elif path.suffix == ".bin":
         logger.info(f"Reading quanta from binary file: {path}")
-        frames = read_quanta_bin(path, H=H, W=W)
+        frames = read_quanta_bin(path, H=H, W=W, load_data=load_data)
         return frames, None
     elif path.suffix == ".mat":
         logger.info(f"Reading quanta from MATLAB file: {path}")
-        frames = read_quanta_mat(path, key=key)
+        frames = read_quanta_mat(path, key=key, load_data=load_data)
         return frames, None
     # otherwise, assume it's a directory of .bin or .mat files
     logger.info(f"Reading quanta from directory of quanta files: {path}")
-    frames = read_quanta_dir(path, H=H, W=W, key=key)
+    frames = read_quanta_dir(path, H=H, W=W, key=key, load_data=load_data)
     return frames, None
 
 
