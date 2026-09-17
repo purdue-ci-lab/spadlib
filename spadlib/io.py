@@ -345,21 +345,17 @@ def write_async_spad_zarr(
     )
 
 
-def write_quanta_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
+def write_quanta_zarr(path, frames, T_exp=None, fps=None):
     """
     Write binary quanta frames to a Zarr group.
 
-    Originally write_quantaframes_zarr(path, frames, T_exp, fps, save_coords), then
-    write_frames_zarr(path, frames, T_exp, fps, save_coords).
+    Originally write_quantaframes_zarr, then write_frames_zarr.
 
     Args:
         path (str or Path): Path to the output Zarr file.
         frames (np.ndarray): Array of shape (T, H, W) with binary frames.
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
-        save_coords (bool): if True, also saves the (t, y, x) coordinates of events (for
-            speed purposes so they don't have to be recomputed). Set to False to save
-            disk space.
     """
     if T_exp is None:
         if fps is not None:
@@ -383,27 +379,12 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, save_coords=False):
     frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
     max_chunk_bytes = 200_000_000
     max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
-    if save_coords:
-        t, y, x = frames_to_events(frames, T_exp=T_exp, normalize=True)
-        quantadata = {
-            "frames": frames,
-            "t": t,
-            "y": y,
-            "x": x
-        }
-        chunks = {
-            "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
-            "t": (100_000_000,),
-            "y": (100_000_000,),
-            "x": (100_000_000,),
-        }
-    else:
-        quantadata = {
-            "frames": frames
-        }
-        chunks = {
-            "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
-        }
+    quantadata = {
+        "frames": frames
+    }
+    chunks = {
+        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
+    }
     compressors = {
         "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
     }
@@ -591,12 +572,23 @@ def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
     return points, pixel_timeseries
 
 
-def read_async_spad_zarr(path, load_data=True):
+def read_async_spad_zarr(path, load_data=False, return_meta=False):
     """
     Read asynchronous SPAD event data (per-pixel timestamps + flat coords) from a
     Zarr group.
 
     Originally read_asyncspad_zarr(path, load_data).
+
+    Args:
+        path (str or Path): path to the Zarr group.
+        load_data (bool): if True, read the (t, y, x) event coordinates into memory as
+            numpy arrays. If False (default), return the lazy zarr arrays. The per-pixel
+            timestamps are always read into memory.
+        return_meta (bool): if True, also return the group attributes.
+
+    Returns:
+        tuple: ``((t, y, x), pixel_timeseries)``, or
+        ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
     """
     root = zarr.open_group(path, mode="r")
 
@@ -618,7 +610,9 @@ def read_async_spad_zarr(path, load_data=True):
         t = t[:]
         y = y[:]
         x = x[:]
-    return (t, y, x), pixel_timeseries, root.attrs
+    if return_meta:
+        return (t, y, x), pixel_timeseries, root.attrs
+    return (t, y, x), pixel_timeseries
 
 
 class LazyQuantaFrames:
@@ -768,13 +762,13 @@ class _QuantaMatFile:
         return np.transpose(arr, (2, 0, 1))
 
 
-def read_quanta_bin(path, H=512, W=512, load_data=True):
+def read_quanta_bin(path, H=512, W=512, load_data=False):
     """
     Read a single binary SPAD512 file.
 
     Args:
         load_data (bool): if True, read the whole file into memory as a numpy array. If
-            False, return a :class:`LazyQuantaFrames` that reads frames when indexed.
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
 
     Ripped from spadtools (https://github.com/lyehe/spadtools).
     """
@@ -862,7 +856,7 @@ def _inspect_mat_array(mat_path, key=None):
         raise
 
 
-def read_quanta_mat(path, key=None, load_data=True):
+def read_quanta_mat(path, key=None, load_data=False):
     """
     Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
     (consistent with :func:`read_quanta_bin`).
@@ -875,7 +869,7 @@ def read_quanta_mat(path, key=None, load_data=True):
         key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
             volume. If None, expects exactly one 3D array in the file.
         load_data (bool): if True, read the whole volume into memory as a numpy array. If
-            False, return a :class:`LazyQuantaFrames` that reads frames when indexed.
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
     """
     frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
     return frames[:] if load_data else frames
@@ -906,7 +900,7 @@ def _read_mat_meta(path):
         return None
 
 
-def _read_quanta_mat_dir(path, matpaths, key=None, load_data=True):
+def _read_quanta_mat_dir(path, matpaths, key=None, load_data=False):
     """
     Read and concatenate a directory of MATLAB ``.mat`` quanta volumes into ``(T, H, W)``.
 
@@ -932,7 +926,7 @@ def _read_quanta_mat_dir(path, matpaths, key=None, load_data=True):
     return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
 
 
-def read_quanta_dir(path, H=512, W=512, key=None, load_data=True):
+def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
     """
     Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
     array.
@@ -951,8 +945,8 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=True):
             SPAD512 .bin files). Ignored for .mat files, where they are inferred.
         key (str or None): For .mat files, the variable/dataset name holding the volume.
             If None, expects exactly one 3D array per file.
-        load_data (bool): if True, read all files into memory as a numpy array. If False,
-            return a :class:`LazyQuantaFrames` over all files that reads frames when
+        load_data (bool): if True, read all files into memory as a numpy array. If False
+            (default), return a :class:`LazyQuantaFrames` over all files that reads frames when
             indexed.
     """
     path = Path(path)
@@ -978,16 +972,23 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=True):
     raise FileNotFoundError(f"No *.bin or *.mat files found in {path}")
 
 
-def read_quanta_zarr(path, load_data=True):
+def read_quanta_zarr(path, load_data=False, return_meta=False):
     """
-    Reads quanta data from a Zarr v3 group and returns:
-      - frames: (T,H,W) array (lazy unless load_data=True)
-      - (t,y,x): optional coordinate arrays if present
-      - attrs: group attributes
+    Read quanta frames from a Zarr v3 group.
 
     Works with:
       - "original" QuantaBurst zarr (frames/quantaframes + rich attrs)
       - your concatenated zarr (data + different attrs)
+
+    Args:
+        path (str or Path): path to the Zarr group.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy zarr array.
+        return_meta (bool): if True, also return the group attributes.
+
+    Returns:
+        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
+        return_meta=True.
     """
     zarrdata = zarr.open_group(str(path), mode="r")
 
@@ -1004,48 +1005,32 @@ def read_quanta_zarr(path, load_data=True):
         )
 
     frames = zarrdata[framekey]
-
-    # Optional coordinates
-    coord_keys = set(zarrdata.array_keys())  # arrays again
-    contains_coords = all(k in coord_keys for k in ("t", "y", "x"))
-    if contains_coords:
-        t = zarrdata["t"]
-        y = zarrdata["y"]
-        x = zarrdata["x"]
-    else:
-        t = y = x = None
-
     if load_data:
         frames = frames[:]
-        if contains_coords:
-            t = t[:]
-            y = y[:]
-            x = x[:]
 
     # attrs differ between the two formats; just return them as-is
-    return frames, (t, y, x), dict(zarrdata.attrs)
+    return (frames, dict(zarrdata.attrs)) if return_meta else frames
 
 
-def read_quanta_gated_zarr(path, load_data=False):
+def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
     """
     Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
     array (not a group).
 
-    Note that `load_data` defaults to False here, unlike the other zarr readers: a
-    gated acquisition is typically far too large to hold in memory (the reason it is
-    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place),
-    so the lazy zarr array is returned by default and sliced by the caller.
+    A gated acquisition is typically far too large to hold in memory (the reason it is
+    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place), so
+    the lazy zarr array is returned by default and sliced by the caller.
 
     Args:
         path (str or Path): path to the Zarr array.
         load_data (bool): if True, read the whole acquisition into memory as a numpy
             array. If False (default), return the lazy zarr array.
+        return_meta (bool): if True, also return the array attributes (acquisition
+            metadata).
 
     Returns:
-        tuple:
-            - frames: (n_frames, n_gate_steps, image_height, image_width) array,
-              lazy unless load_data=True.
-            - metadata (dict): the array attributes (acquisition metadata).
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
     """
     try:
         ds = zarr.open_array(path, mode="r")
@@ -1061,43 +1046,45 @@ def read_quanta_gated_zarr(path, load_data=False):
             f"array, got shape {ds.shape}"
         )
     frames = ds[:] if load_data else ds
-    return frames, dict(ds.attrs)
+    return (frames, dict(ds.attrs)) if return_meta else frames
 
 
-def read_quanta_auto(path, load_data=True, H=None, W=None, key=None):
+def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
     """
     Automatically detects the format of the input path and reads the quanta data accordingly:
     a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
 
     Args:
-        load_data (bool): If True, load the data into memory. If False, returns lazy data if supported.
+        load_data (bool): If True, load the data into memory. If False (default), returns
+            lazy data if supported.
+        return_meta (bool): If True, also return the metadata (None for formats that
+            carry none).
         H, W (int): Height and width of the frames where it cannot be inferred (e.g. SPAD512 .bin files).
             Otherwise, these are ignored and inferred from data.
         key (str or None): For .mat inputs, the variable/dataset name holding the volume.
             If None, expects exactly one 3D array per file.
 
     Returns:
-        tuple:
-            - quantaframes: array of shape (T, H, W) with binary frames.
-            - metadata (dict or None): relevant metadata if available, else None.
+        quantaframes: array of shape (T, H, W) with binary frames, lazy unless
+        load_data=True; or ``(quantaframes, metadata)`` if return_meta=True, where
+        metadata is a dict of the relevant metadata if available, else None.
     """
     path = Path(path)
     if path.suffix == ".zarr":
         logger.info(f"Reading quanta from Zarr file: {path}")
-        frames, _, metadata = read_quanta_zarr(path, load_data=load_data)
-        return frames, metadata
+        frames, metadata = read_quanta_zarr(path, load_data=load_data, return_meta=True)
+        return (frames, metadata) if return_meta else frames
     elif path.suffix == ".bin":
         logger.info(f"Reading quanta from binary file: {path}")
         frames = read_quanta_bin(path, H=H, W=W, load_data=load_data)
-        return frames, None
     elif path.suffix == ".mat":
         logger.info(f"Reading quanta from MATLAB file: {path}")
         frames = read_quanta_mat(path, key=key, load_data=load_data)
-        return frames, None
-    # otherwise, assume it's a directory of .bin or .mat files
-    logger.info(f"Reading quanta from directory of quanta files: {path}")
-    frames = read_quanta_dir(path, H=H, W=W, key=key, load_data=load_data)
-    return frames, None
+    else:
+        # otherwise, assume it's a directory of .bin or .mat files
+        logger.info(f"Reading quanta from directory of quanta files: {path}")
+        frames = read_quanta_dir(path, H=H, W=W, key=key, load_data=load_data)
+    return (frames, None) if return_meta else frames
 
 
 # ---------------------------------------------------------------------------

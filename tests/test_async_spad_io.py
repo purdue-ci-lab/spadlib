@@ -64,7 +64,7 @@ def _check_pixels(read_pixels, expected):
 
 
 def test_zarr_roundtrip(zarr_path, pixel_timeseries):
-    (t, y, x), read_pixels, attrs = read_async_spad_zarr(zarr_path)
+    (t, y, x), read_pixels, attrs = read_async_spad_zarr(zarr_path, load_data=True, return_meta=True)
     _check_pixels(read_pixels, pixel_timeseries)
     npoints = n_photons(pixel_timeseries)
     assert len(t) == len(y) == len(x) == npoints
@@ -78,7 +78,7 @@ def test_events_match_pixels(zarr_path, pixel_timeseries):
     Each flat (t, y, x) event must be a photon of the pixel it points at, and the
     per-pixel counts must match.
     """
-    (t, y, x), read_pixels, _ = read_async_spad_zarr(zarr_path)
+    (t, y, x), read_pixels = read_async_spad_zarr(zarr_path, load_data=True)
     counts = np.zeros((H, W), dtype="int64")
     for ti, yi, xi in zip(t, y, x):
         assert ti in read_pixels[int(yi)][int(xi)]
@@ -89,7 +89,7 @@ def test_events_match_pixels(zarr_path, pixel_timeseries):
 
 def test_rate_stats(zarr_path, pixel_timeseries):
     rates = np.array([[as_array(ts).size for ts in row] for row in pixel_timeseries]) / T_EXP
-    _, _, attrs = read_async_spad_zarr(zarr_path)
+    _, _, attrs = read_async_spad_zarr(zarr_path, return_meta=True)
     assert attrs["avg_pts_persec_perpixel"] == pytest.approx(np.mean(rates))
     assert attrs["max_pts_persec_perpixel"] == pytest.approx(np.max(rates))
     assert attrs["min_pts_persec_perpixel"] == pytest.approx(0.0)  # pixel (2, 3)
@@ -100,7 +100,7 @@ def test_rate_stats(zarr_path, pixel_timeseries):
 def test_extra_attrs(tmp_path, pixel_timeseries):
     path = tmp_path / "extra.zarr"
     write_async_spad_zarr(path, pixel_timeseries, T_exp=T_EXP, attrs={"channel": "G"})
-    _, _, attrs = read_async_spad_zarr(path)
+    _, _, attrs = read_async_spad_zarr(path, return_meta=True)
     assert attrs["channel"] == "G"
 
 
@@ -115,7 +115,7 @@ def test_npy_dir_roundtrip(tmp_path, pixel_timeseries):
 
     path = tmp_path / "from_dir.zarr"
     write_async_spad_zarr(path, read_pixels, T_exp=T_EXP, points=points)
-    (t, y, x), zarr_pixels, attrs = read_async_spad_zarr(path)
+    (t, y, x), zarr_pixels, attrs = read_async_spad_zarr(path, load_data=True, return_meta=True)
 
     _check_pixels(zarr_pixels, pixel_timeseries)
     assert attrs["npoints"] == points.shape[0] == n_photons(pixel_timeseries)
@@ -129,7 +129,7 @@ def test_no_photons(tmp_path):
     """An acquisition where no pixel saw a photon still writes and reads back."""
     path = tmp_path / "empty.zarr"
     write_async_spad_zarr(path, [[None] * 3 for _ in range(2)], T_exp=1.0)
-    (t, y, x), read_pixels, attrs = read_async_spad_zarr(path)
+    (t, y, x), read_pixels, attrs = read_async_spad_zarr(path, load_data=True, return_meta=True)
     assert len(t) == len(y) == len(x) == 0
     assert attrs["npoints"] == 0
     assert all(read_pixels[i][j].size == 0 for i in range(2) for j in range(3))

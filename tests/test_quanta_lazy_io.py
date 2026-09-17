@@ -94,10 +94,10 @@ SOURCES = {
     "mat_dir": ("mat_dir", read_quanta_dir),
     "uneven_bin_dir": ("uneven_bin_dir", lambda p, **kw: read_quanta_dir(p, H=H, W=W, **kw)),
     "uneven_mat_dir": ("uneven_mat_dir", read_quanta_dir),
-    "auto_bin": ("bin_path", lambda p, **kw: read_quanta_auto(p, H=H, W=W, **kw)[0]),
-    "auto_mat": ("mat_path", lambda p, **kw: read_quanta_auto(p, **kw)[0]),
-    "auto_bin_dir": ("uneven_bin_dir", lambda p, **kw: read_quanta_auto(p, H=H, W=W, **kw)[0]),
-    "auto_mat_dir": ("uneven_mat_dir", lambda p, **kw: read_quanta_auto(p, **kw)[0]),
+    "auto_bin": ("bin_path", lambda p, **kw: read_quanta_auto(p, H=H, W=W, **kw)),
+    "auto_mat": ("mat_path", read_quanta_auto),
+    "auto_bin_dir": ("uneven_bin_dir", lambda p, **kw: read_quanta_auto(p, H=H, W=W, **kw)),
+    "auto_mat_dir": ("uneven_mat_dir", read_quanta_auto),
 }
 
 
@@ -111,7 +111,7 @@ def source(request):
 @pytest.fixture
 def lazy(source):
     path, reader = source
-    return reader(path, load_data=False)
+    return reader(path)  # load_data defaults to False
 
 
 def test_lazy_type_and_attributes(lazy):
@@ -213,4 +213,4 @@ def test_lazy_bin_nonsquare_shape(tmp_path):
     lazy = read_quanta_bin(path, H=h, W=w, load_data=False)
     assert lazy.shape == (4, w, h)
     np.testing.assert_array_equal(lazy[1:3, 5], rot_frames[1:3, 5])
-    np.testing.assert_array_equal(read_quanta_bin(path, H=h, W=w), rot_frames)
+    np.testing.assert_array_equal(read_quanta_bin(path, H=h, W=w, load_data=True), rot_frames)

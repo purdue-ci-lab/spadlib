@@ -213,7 +213,7 @@ def test_read_quanta_gated_zarr(tmp_path, gated_dir_path, images):
     write_quanta_gated_zarr(out, gd, frames_per_chunk=2, n_workers=2)
 
     # lazy by default
-    frames, meta = read_quanta_gated_zarr(out)
+    frames, meta = read_quanta_gated_zarr(out, return_meta=True)
     assert isinstance(frames, zarr.Array)
     assert frames.shape == (N_FRAMES, N_GATE_STEPS, HEIGHT, WIDTH)
     np.testing.assert_array_equal(frames[1, 2], images[1, 2])
@@ -226,7 +226,7 @@ def test_read_quanta_gated_zarr(tmp_path, gated_dir_path, images):
     assert meta["source_dir"] == str(gated_dir_path)
 
     # eager
-    frames_loaded, meta_loaded = read_quanta_gated_zarr(out, load_data=True)
+    frames_loaded, meta_loaded = read_quanta_gated_zarr(out, load_data=True, return_meta=True)
     assert isinstance(frames_loaded, np.ndarray)
     np.testing.assert_array_equal(frames_loaded, images)
     assert meta_loaded == meta
