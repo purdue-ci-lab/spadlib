@@ -99,7 +99,7 @@ def read_image_dir(path, grayscale: bool = False) -> np.ndarray:
 
 def write_video(
     frames: np.ndarray, path, res_scale=1.0, playback_fps=None, gamma=1.0, cmap=None, fileformat=None,
-    vmin=None, vmax=None, quantile=None, framenames=None, verbose=False
+    vmin=None, vmax=None, qmin=None, qmax=None, framenames=None, verbose=False
 ):
     """
     Saves video frame arrays to a video file or sequence of PNGs. If path has no extension,
@@ -115,8 +115,8 @@ def write_video(
         cmap: ignored if frames are RGB; otherwise, matplotlib colormap name or object.
         fileformat (str or None): video format (e.g., "mp4", "avi"), or image format (e.g., "png");
             if None, inferred from path suffix.
-        quantile (float or None): if not None, use quantiles to determine vmin and vmax for normalization
-            (ignored if vmin or vmax are specified).
+        qmin (float or None): if not None, use this quantile of frames as vmin (ignored if vmin is specified).
+        qmax (float or None): if not None, use this quantile of frames as vmax (ignored if vmax is specified).
     """
     path = Path(path)
     if cmap is None:
@@ -135,13 +135,13 @@ def write_video(
 
     # compute a normalized intensity in [0,1] for colormap input
     if vmax is None:
-        if quantile is not None:
-            vmax = float(np.quantile(frames, quantile))
+        if qmax is not None:
+            vmax = float(np.quantile(frames, qmax))
         else:
             vmax = float(np.max(frames))
     if vmin is None:
-        if quantile is not None:
-            vmin = float(np.quantile(frames, 1 - quantile))
+        if qmin is not None:
+            vmin = float(np.quantile(frames, qmin))
         else:
             vmin = float(np.min(frames))
             if vmin >= 0:
