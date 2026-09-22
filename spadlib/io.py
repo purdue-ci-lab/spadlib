@@ -249,8 +249,7 @@ def write_async_spad_npys(pixel_timeseries, output_dir):
 def write_async_spad_zarr(
     path,
     pixel_timeseries,
-    T_exp,
-    points=None,
+    T_exp=None,
     attrs=None,
     n_workers=8,
     overwrite=True,
@@ -258,10 +257,11 @@ def write_async_spad_zarr(
     """
     Write asynchronous SPAD data (per-pixel photon timestamps) to a Zarr group.
 
-    The per-pixel arrays are flattened into a single ``timestamps`` array in row-major
-    pixel order, indexed by ``offsets``/``lengths`` of shape (H, W), so pixel (i, j) is
-    ``timestamps[offsets[i, j]:offsets[i, j] + lengths[i, j]]``. The flat event
-    coordinates are also stored as ``t``/``y``/``x``.
+    The per-pixel arrays are flattened into a single ``t`` array in row-major pixel
+    order, indexed by ``offsets``/``lengths`` of shape (H, W), so pixel (i, j) is
+    ``t[offsets[i, j]:offsets[i, j] + lengths[i, j]]``. The matching event coordinates
+    are stored alongside as ``y``/``x``, so ``(t, y, x)`` is the flat event view of the
+    very same photons, in the same order.
 
     This is the write counterpart to :func:`read_async_spad_zarr`.
 
@@ -270,11 +270,11 @@ def write_async_spad_zarr(
         pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
             arrays, as returned by :func:`read_async_spad_dir`. ``None`` entries are
             treated as pixels with no photons.
-        T_exp (float): exposure/acquisition time in seconds, used for the per-pixel
-            photon rate statistics.
-        points (np.ndarray or None): (N, 3) array of [t, y, x] event coordinates, as
-            returned by :func:`read_async_spad_dir`. If None, they are rebuilt from
-            `pixel_timeseries` (in row-major pixel order, with unnormalized y/x).
+        T_exp (float or None): exposure/acquisition time in seconds, used for the
+            per-pixel photon rate statistics. If None, it is inferred from the latest
+            photon in `pixel_timeseries`, which is only a lower bound on the true
+            exposure (the detector is usually still running after the last photon), so
+            pass it explicitly when the rates need to be exact.
         attrs (dict or None): extra attributes, merged over the computed metadata.
         n_workers (int): number of worker threads writing arrays concurrently.
         overwrite (bool): if True, overwrite an existing zarr at `path`.
@@ -297,31 +297,32 @@ def write_async_spad_zarr(
             flat_list.append(arr)
     # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
     offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
-    timestamps = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
+    t = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
 
-    if points is None:
-        ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-        t = timestamps
-        y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
-        x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
-    else:
-        points = np.asarray(points)
-        t, y, x = points[:, 0], points[:, 1], points[:, 2]
+    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
+    x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
+
+    if T_exp is None:
+        if t.size == 0:
+            raise ValueError(
+                "T_exp cannot be inferred from an acquisition with no photons; pass T_exp."
+            )
+        T_exp = float(t.max())
 
     pixel_photon_rates = lengths / T_exp
     data = {
-        "timestamps": timestamps,
-        "offsets": offsets,
-        "lengths": lengths,
         "t": t,
         "y": y,
         "x": x,
+        "offsets": offsets,
+        "lengths": lengths,
     }
     # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
     chunks = {
         # max(1, ...) so a dataset with no photons still gets a valid chunk shape
         key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
-        for key in ("timestamps", "t", "y", "x")
+        for key in ("t", "y", "x")
     }
     metadata = {
         "T_exp": T_exp,
@@ -514,7 +515,7 @@ def write_quanta_gated_zarr(
 # ---------------------------------------------------------------------------
 # SPAD readers
 # ---------------------------------------------------------------------------
-def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
+def read_async_spad_dir(dirpath, h, w):
     """
     Reads a folder of .npy files containing per-pixel timestamp arrays.
     Each .npy file is expected to be named with the pattern "posX{X}_posY{Y}.npy"
@@ -524,6 +525,9 @@ def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
 
     If there are multiple channels, there will be multiple folders. Run this for each
     folder.
+
+    Timestamps and pixel coordinates are returned as stored, unnormalized; thin the
+    result with :func:`spadlib.processing.thin_events_uniform` if needed.
 
     Returns:
         tuple:
@@ -542,19 +546,11 @@ def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
         py = int(m.group(2))
 
         timestamps = np.load(fn)
-        timestamps = timestamps[timestamps <= T_exp]
         if timestamps.size == 0:
             continue
-        if normalize:
-            timestamps /= T_exp  # normalize to [0, 1]
 
-        if normalize:
-            # normalize to [0, 1]
-            x_vals = np.full(timestamps.shape[0], float(px) / w)
-            y_vals = np.full(timestamps.shape[0], float(py) / h)
-        else:
-            x_vals = np.full(timestamps.shape[0], float(px))
-            y_vals = np.full(timestamps.shape[0], float(py))
+        x_vals = np.full(timestamps.shape[0], float(px))
+        y_vals = np.full(timestamps.shape[0], float(py))
 
         pts = np.stack([
             timestamps.astype("float64"),
@@ -565,10 +561,136 @@ def read_async_spad_dir(dirpath, h, w, T_exp, keep_prob=1.0, normalize=False):
         pixel_timeseries[py][px] = timestamps
     points = np.vstack(all_points)
     logger.info(f"Read {points.shape[0]} points from folder {dirpath}")
-    if keep_prob < 1.0:
-        nevents_orig = points.shape[0]
-        points = thin_events_uniform(points, keep_prob=keep_prob, seed=42)
-        logger.info(f"Kept {points.shape[0]} of {nevents_orig} points after thinning")
+    return points, pixel_timeseries
+
+
+# Piccolo 32x32 sensor: photon arrival is a coarse counter tick minus a fine counter
+# tick, and the coarse counter is 16 bits wide, so it wraps every PICCOLO_ROLLOVER_S.
+PICCOLO_COARSE_TICK_S = 6.25e-9
+PICCOLO_FINE_TICK_S = 50e-12
+PICCOLO_ROLLOVER_S = 2**16 * PICCOLO_COARSE_TICK_S
+
+
+def _find_piccolo_timestamp_mats(dirpath):
+    """
+    Return ``(indices, paths)`` for every ``timestamps_{n}.mat`` in `dirpath`, sorted by
+    the integer n. The index is not zero-padded on disk, so a plain string sort would be
+    wrong (``timestamps_10.mat`` before ``timestamps_2.mat``).
+    """
+    dirpath = Path(dirpath)
+    pat = re.compile(r"^timestamps_(\d+)\.mat$")
+    found = {}
+    for f in dirpath.iterdir():
+        m = pat.match(f.name)
+        if m:
+            found[int(m.group(1))] = f
+    if not found:
+        raise FileNotFoundError(f"No timestamps_*.mat files found in {dirpath}")
+    idxs = sorted(found)  # numeric (natural) order
+    return idxs, [found[i] for i in idxs]
+
+
+def read_async_spad_piccolo_dir(
+    dirpath,
+    acq_per,
+    rows=None,
+    cols=None,
+    transpose=False,
+    return_meta=False,
+):
+    """
+    Read asynchronous SPAD data from a directory of Piccolo 32x32 ``timestamps_{n}.mat``
+    files, one file per acquisition frame.
+
+    Each file holds two (H, W) object arrays of per-pixel counter values,
+    ``timestampsCounter1`` (coarse) and ``timestampsCounter2`` (fine); a photon's time
+    within its frame is ``coarse * PICCOLO_COARSE_TICK_S - fine * PICCOLO_FINE_TICK_S``.
+    Frame ``n`` starts at ``n * acq_per``, truncated down to a whole number of coarse
+    counter rollovers, since the counter's phase within a rollover is already carried by
+    the coarse value itself.
+
+    Files are read in natural numeric order and the first present index is treated as
+    frame 0. Gaps in the index sequence (missing files) are simply absent data, but the
+    true (gap-preserving) index places each frame in global time, so a missing frame does
+    not shift the timing of the frames that follow it. ``num_frames`` is therefore the
+    index span, not the file count, and ``T_exp = acq_per * num_frames``.
+
+    This is the Piccolo counterpart to :func:`read_async_spad_dir`, and its
+    `pixel_timeseries` can be passed straight to :func:`write_async_spad_zarr`.
+
+    Args:
+        dirpath (str or Path): directory of ``timestamps_{n}.mat`` files.
+        acq_per (float): acquisition period of one frame, in seconds.
+        rows, cols (array-like or None): sensor rows/columns to read (default: all). In
+            the returned grid, pixels outside the selection are ``None``, while selected
+            pixels that saw no photons are empty arrays.
+        transpose (bool): if True, read the raw counter arrays with their two sensor axes
+            swapped -- some captures store the array transposed. The returned grid is
+            still indexed ``[row][col]`` in output coordinates.
+        return_meta (bool): if True, also return a metadata dict.
+
+    Returns:
+        tuple: ``(points, pixel_timeseries)``, or ``(points, pixel_timeseries, meta)`` if
+        return_meta=True, where `points` is an (N, 3) array of [t, y, x] and `meta`
+        carries ``acq_per``, ``T_exp``, ``num_frames``, ``H``, ``W`` and
+        ``first_frame_index``.
+    """
+    import scipy.io
+
+    idxs, files = _find_piccolo_timestamp_mats(dirpath)
+    idx0 = idxs[0]                        # first present index -> treat as frame 0
+    num_frames = idxs[-1] - idx0 + 1      # span including any gaps
+    T_exp = acq_per * num_frames
+
+    chunks = None                         # (row, col) -> list of per-frame arrays
+    for idx, f in zip(tqdm(idxs, desc="Reading piccolo .mat files"), files):
+        n = idx - idx0                    # true frame index (preserves gaps)
+        mat = scipy.io.loadmat(f, squeeze_me=True)
+        c1 = mat["timestampsCounter1"]    # coarse counts, object array (H, W)
+        c2 = mat["timestampsCounter2"]    # fine counts, object array (H, W)
+        if transpose:
+            c1, c2 = c1.T, c2.T           # swap sensor axes for transposed captures
+        if chunks is None:
+            h, w = c1.shape
+            rows = np.arange(h) if rows is None else np.asarray(rows)
+            cols = np.arange(w) if cols is None else np.asarray(cols)
+            chunks = {(int(r), int(c)): [] for r in rows for c in cols}
+        # frame start, truncated to a whole number of coarse counter rollovers
+        frame_t0 = n * acq_per - np.mod(n * acq_per, PICCOLO_ROLLOVER_S)
+        for (r, c), parts in chunks.items():
+            parts.append(
+                PICCOLO_COARSE_TICK_S * np.atleast_1d(c1[r, c]).astype("float64")
+                - PICCOLO_FINE_TICK_S * np.atleast_1d(c2[r, c]).astype("float64")
+                + frame_t0
+            )
+
+    pixel_timeseries = [[None] * w for _ in range(h)]
+    all_points = []
+    for (r, c), parts in chunks.items():
+        timestamps = np.sort(np.concatenate(parts, dtype="float64"))
+        pixel_timeseries[r][c] = timestamps
+        if timestamps.size:
+            all_points.append(np.stack([
+                timestamps,
+                np.full(timestamps.size, float(r)),
+                np.full(timestamps.size, float(c)),
+            ], axis=1))
+
+    points = np.vstack(all_points) if all_points else np.empty((0, 3), dtype="float64")
+    logger.info(
+        f"Read {points.shape[0]} points from {len(idxs)} piccolo files in {dirpath} "
+        f"(num_frames={num_frames}, T_exp={T_exp})"
+    )
+    if return_meta:
+        meta = {
+            "acq_per": acq_per,
+            "T_exp": T_exp,
+            "num_frames": num_frames,
+            "H": h,
+            "W": w,
+            "first_frame_index": idx0,
+        }
+        return points, pixel_timeseries, meta
     return points, pixel_timeseries
 
 
@@ -593,7 +715,7 @@ def read_async_spad_zarr(path, load_data=False, return_meta=False):
     root = zarr.open_group(path, mode="r")
 
     # can't really lazily load this data
-    timestamps = root["timestamps"][:]
+    timestamps = root["t"][:]
     offsets = root["offsets"][:]
     lengths = root["lengths"][:]
 
@@ -605,9 +727,10 @@ def read_async_spad_zarr(path, load_data=False, return_meta=False):
             start = offsets[i, j]
             length = lengths[i, j]
             pixel_timeseries[i][j] = timestamps[start: start + length]
-    t, y, x = root["t"], root["y"], root["x"]
+    # t is already in memory for the per-pixel slicing above
+    t = timestamps if load_data else root["t"]
+    y, x = root["y"], root["x"]
     if load_data:
-        t = t[:]
         y = y[:]
         x = x[:]
     if return_meta:

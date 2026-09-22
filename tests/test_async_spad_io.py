@@ -106,23 +106,42 @@ def test_extra_attrs(tmp_path, pixel_timeseries):
 
 def test_npy_dir_roundtrip(tmp_path, pixel_timeseries):
     """
-    The notebook flow: read a folder of per-pixel .npy files, then write it to Zarr
-    with the reader's own ``points``.
+    The notebook flow: read a folder of per-pixel .npy files, then write it to Zarr.
     """
     npy_dir = tmp_path / "npys"
     write_async_spad_npys([[as_array(ts) for ts in row] for row in pixel_timeseries], npy_dir)
-    points, read_pixels = read_async_spad_dir(npy_dir, h=H, w=W, T_exp=T_EXP)
+    points, read_pixels = read_async_spad_dir(npy_dir, h=H, w=W)
 
     path = tmp_path / "from_dir.zarr"
-    write_async_spad_zarr(path, read_pixels, T_exp=T_EXP, points=points)
+    write_async_spad_zarr(path, read_pixels, T_exp=T_EXP)
     (t, y, x), zarr_pixels, attrs = read_async_spad_zarr(path, load_data=True, return_meta=True)
 
     _check_pixels(zarr_pixels, pixel_timeseries)
     assert attrs["npoints"] == points.shape[0] == n_photons(pixel_timeseries)
-    # points= is stored as given, event for event
-    np.testing.assert_array_equal(t, points[:, 0])
-    np.testing.assert_array_equal(y, points[:, 1])
-    np.testing.assert_array_equal(x, points[:, 2])
+    # same events as the directory reader, but the zarr is always in row-major pixel
+    # order, while the .npy files are globbed in column-major (posX before posY) order
+    stored = np.stack([t, y, x], axis=1)
+    np.testing.assert_array_equal(
+        stored[np.lexsort(stored.T)], points[np.lexsort(points.T)]
+    )
+
+
+def test_infer_T_exp(tmp_path, pixel_timeseries):
+    """Omitting T_exp infers it from the latest photon."""
+    path = tmp_path / "inferred.zarr"
+    write_async_spad_zarr(path, pixel_timeseries, T_exp=None)
+    _, _, attrs = read_async_spad_zarr(path, return_meta=True)
+    latest = max(as_array(ts).max() for row in pixel_timeseries for ts in row if as_array(ts).size)
+    assert attrs["T_exp"] == pytest.approx(latest)
+
+    rates = np.array([[as_array(ts).size for ts in row] for row in pixel_timeseries]) / latest
+    assert attrs["avg_pts_persec_perpixel"] == pytest.approx(np.mean(rates))
+
+
+def test_infer_T_exp_no_photons_raises(tmp_path):
+    """There is no latest photon to infer from, so the caller must say."""
+    with pytest.raises(ValueError, match="T_exp"):
+        write_async_spad_zarr(tmp_path / "nope.zarr", [[None] * 3 for _ in range(2)])
 
 
 def test_no_photons(tmp_path):
