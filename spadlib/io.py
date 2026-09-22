@@ -734,7 +734,7 @@ def read_async_spad_zarr(path, load_data=False, return_meta=False):
         y = y[:]
         x = x[:]
     if return_meta:
-        return (t, y, x), pixel_timeseries, root.attrs
+        return (t, y, x), pixel_timeseries, dict(root.attrs)
     return (t, y, x), pixel_timeseries
 
 
