@@ -1588,6 +1588,44 @@ def frames_to_pixel_timeseries(frames, T_exp):
     return pixel_timeseries
 
 
+def pixel_timeseries_to_events(pixel_timeseries):
+    """
+    Flatten an H x W list of lists of per-pixel timestamps into spatiotemporal events
+    (t, y, x), in row-major pixel order.
+
+    ``None`` entries are treated as pixels with no photons. Unlike
+    :func:`events_to_pixel_timeseries`, which expects x, y, t normalized to [0, 1], the
+    events come back unnormalized: t as stored, and y/x as pixel indices. This matches
+    the ``points`` of :func:`read_async_spad_dir` and the flat coordinates written by
+    :func:`write_async_spad_zarr`.
+
+    Args:
+        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
+            arrays, as returned by :func:`read_async_spad_dir`.
+
+    Returns:
+        tuple:
+            - t: 1D array of event times
+            - y: 1D array of y (row) coordinates
+            - x: 1D array of x (column) coordinates
+    """
+    H = len(pixel_timeseries)
+    W = len(pixel_timeseries[0])
+    if any(len(row) != W for row in pixel_timeseries):
+        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
+
+    arrs = [
+        np.asarray([] if timestamps is None else timestamps, dtype="float64")
+        for row in pixel_timeseries for timestamps in row
+    ]
+    lengths = np.array([a.size for a in arrs])
+    t = np.concatenate(arrs) if arrs else np.array([], dtype="float64")
+    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    y = np.repeat(ys.ravel(), lengths).astype("float64")
+    x = np.repeat(xs.ravel(), lengths).astype("float64")
+    return t, y, x
+
+
 # ---------------------------------------------------------------------------
 # Pre-convention name aliases
 # ---------------------------------------------------------------------------

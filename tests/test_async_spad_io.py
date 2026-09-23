@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from spadlib.io import (
+    pixel_timeseries_to_events,
     read_async_spad_dir,
     read_async_spad_zarr,
     write_async_spad_npys,
@@ -152,6 +153,41 @@ def test_no_photons(tmp_path):
     assert len(t) == len(y) == len(x) == 0
     assert attrs["npoints"] == 0
     assert all(read_pixels[i][j].size == 0 for i in range(2) for j in range(3))
+
+
+def test_pixel_timeseries_to_events(pixel_timeseries):
+    """Every event points at a photon of its own pixel, with the counts to match."""
+    t, y, x = pixel_timeseries_to_events(pixel_timeseries)
+    assert len(t) == len(y) == len(x) == n_photons(pixel_timeseries)
+
+    counts = np.zeros((H, W), dtype="int64")
+    for ti, yi, xi in zip(t, y, x):
+        assert ti in as_array(pixel_timeseries[int(yi)][int(xi)])
+        counts[int(yi), int(xi)] += 1
+    expected = np.array([[as_array(ts).size for ts in row] for row in pixel_timeseries])
+    np.testing.assert_array_equal(counts, expected)
+
+
+def test_pixel_timeseries_to_events_matches_zarr(tmp_path, pixel_timeseries):
+    """The conversion agrees with the flat coordinates the zarr writer stores."""
+    path = tmp_path / "events.zarr"
+    write_async_spad_zarr(path, pixel_timeseries, T_exp=T_EXP)
+    (zt, zy, zx), _ = read_async_spad_zarr(path, load_data=True)
+    t, y, x = pixel_timeseries_to_events(pixel_timeseries)
+    np.testing.assert_array_equal(t, zt)
+    np.testing.assert_array_equal(y, zy)
+    np.testing.assert_array_equal(x, zx)
+
+
+def test_pixel_timeseries_to_events_no_photons():
+    t, y, x = pixel_timeseries_to_events([[None] * 3 for _ in range(2)])
+    assert len(t) == len(y) == len(x) == 0
+
+
+def test_pixel_timeseries_to_events_ragged_raises(pixel_timeseries):
+    pixel_timeseries[1] = pixel_timeseries[1][:-1]
+    with pytest.raises(ValueError):
+        pixel_timeseries_to_events(pixel_timeseries)
 
 
 def test_ragged_rows_raise(tmp_path, pixel_timeseries):
