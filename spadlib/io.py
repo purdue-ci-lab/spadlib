@@ -22,6 +22,7 @@ Also includes generic array <-> Zarr helpers used by the SPAD writers.
 import json
 import logging
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import accumulate, product
 from pathlib import Path
@@ -998,6 +999,25 @@ def read_quanta_mat(path, key=None, load_data=False):
     return frames[:] if load_data else frames
 
 
+def _ignore_dotfiles(paths):
+    """
+    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
+    listing, warning about any that were found.
+    """
+    kept, dotfiles = [], []
+    for p in paths:
+        (dotfiles if p.name.startswith(".") else kept).append(p)
+    if dotfiles:
+        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
+        # dot_clean only exists on macOS, so only suggest it there
+        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
+        logger.warning(
+            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
+            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
+        )
+    return kept
+
+
 def _read_mat_meta(path):
     """
     Read the optional MATLAB-volume metadata sidecar from a directory.
@@ -1012,7 +1032,7 @@ def _read_mat_meta(path):
     path = Path(path)
     meta_path = path / "info.json"
     if not meta_path.is_file():
-        candidates = sorted(path.glob("*.json"))
+        candidates = sorted(_ignore_dotfiles(path.glob("*.json")))
         if not candidates:
             return None
         meta_path = candidates[0]
@@ -1076,19 +1096,19 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
     if not path.is_dir():
         raise FileNotFoundError(f"Path {path} is not a directory")
 
-    binpaths = sorted(path.glob("*.bin"), key=lambda p: natural_sort_key(p.name))
+    binpaths = sorted(_ignore_dotfiles(path.glob("*.bin")), key=lambda p: natural_sort_key(p.name))
     if binpaths:
         try:
             files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
             frames = LazyQuantaFrames(files)
         except ValueError as e:
-            logger.error("Error with reading likely due to MacOS dotfiles or other garbage. Run `dot_clean` in the directory to clean up dotfiles.")
+            logger.error(f"Error reading the .bin files in {path}, likely due to a truncated or non-SPAD512 file in the directory.")
             raise e
         if not load_data:
             return frames
         return np.concatenate([f.read() for f in tqdm(files, desc="Reading .bin files from directory")], axis=0)
 
-    matpaths = sorted(path.glob("*.mat"), key=lambda p: natural_sort_key(p.name))
+    matpaths = sorted(_ignore_dotfiles(path.glob("*.mat")), key=lambda p: natural_sort_key(p.name))
     if matpaths:
         return _read_quanta_mat_dir(path, matpaths, key=key, load_data=load_data)
 
@@ -1266,7 +1286,7 @@ class QuantaGatedDir:
             raise FileNotFoundError(f"Path {self.path} is not a directory")
 
         parsed = []
-        for f in sorted(self.path.iterdir(), key=lambda p: natural_sort_key(p.name)):
+        for f in sorted(_ignore_dotfiles(self.path.iterdir()), key=lambda p: natural_sort_key(p.name)):
             m = self.FILENAME_RE.match(f.name)
             if m is not None:
                 parsed.append((int(m.group(1)), int(m.group(2)), f))

@@ -180,8 +180,8 @@ def test_lazy_dir_only_reads_indexed_files(request, frames, dir_fixture):
         lazy[2:5]
 
 
-def test_lazy_bin_dir_garbage_file_raises(bin_dir):
-    (bin_dir / "._RAW00000.bin").write_bytes(b"\x00" * 4096)  # macOS AppleDouble dotfile
+def test_lazy_bin_dir_truncated_file_raises(bin_dir):
+    (bin_dir / "RAW00002.bin").write_bytes(b"\x00" * 4096)  # not a whole number of frames
     with pytest.raises(ValueError):
         read_quanta_dir(bin_dir, H=H, W=W, load_data=False)
 

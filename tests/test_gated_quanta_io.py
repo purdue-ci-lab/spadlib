@@ -6,6 +6,8 @@ A tiny synthetic acquisition (3 frames x 4 gate steps of 8 x 6 images) is writte
 out as ``IMG*-*.png`` files; every reader/writer is checked against the ground-truth
 array, whose values encode (frame, gate step) so ordering errors are caught.
 """
+import logging
+
 import cv2
 import numpy as np
 import pytest
@@ -42,6 +44,16 @@ def write_gated_dir(path, images, ext="png"):
             fpath = path / f"IMG{frame_idx:05d}-{gate_idx:04d}.{ext}"
             assert cv2.imwrite(str(fpath), images[frame_idx, gate_idx])
     return path
+
+
+def test_quanta_gated_dir_ignores_dotfiles(gated_dir_path, images, caplog):
+    for frame_idx in range(N_FRAMES):
+        (gated_dir_path / f"._IMG{frame_idx:05d}-0000.png").write_bytes(b"\x00\x05\x16\x07" * 16)
+    with caplog.at_level(logging.WARNING):
+        gd = QuantaGatedDir(gated_dir_path)
+    assert "Ignoring 3 macOS dotfile(s)" in caplog.text
+    assert gd.shape == (N_FRAMES, N_GATE_STEPS, HEIGHT, WIDTH)
+    np.testing.assert_array_equal(gd.read_block(), images)
 
 
 @pytest.fixture
