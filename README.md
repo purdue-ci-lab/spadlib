@@ -35,6 +35,7 @@ pip install "cupy-cuda12x[ctk]"
 ```python
 import spadlib.io as spio
 import spadlib.video_io as vio
+import spadlib.processing as spproc
 
 quanta_path = "path/to/quanta/data"
 frames = spio.read_quanta_auto(
@@ -56,6 +57,10 @@ vio.write_video(
     gamma=1/2.2,
     cmap="grey"  # supports any matplotlib colormap
 )
+
+hotpixel_corrected_frames = spproc.correct_hotpixels(frames[:])
+
+spio.write_quanta_zarr("path/to/hotpixcorrected.zarr", hotpixel_corrected_frames, fps=56_000)
 ```
 
 ## Contributing

@@ -347,7 +347,7 @@ def write_async_spad_zarr(
     )
 
 
-def write_quanta_zarr(path, frames, T_exp=None, fps=None):
+def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
     """
     Write binary quanta frames to a Zarr group.
 
@@ -358,6 +358,7 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None):
         frames (np.ndarray): Array of shape (T, H, W) with binary frames.
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+        n_workers (int): number of worker threads writing arrays concurrently.
     """
     if T_exp is None:
         if fps is not None:
@@ -393,7 +394,7 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None):
     save_arrs_to_zarr(
         quantadata, path,
         chunks=chunks,
-        n_workers=48,
+        n_workers=n_workers,
         overwrite=True,
         attrs={
             "fps": fps,
