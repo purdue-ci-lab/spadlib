@@ -24,7 +24,6 @@ compressed with the shuffle filter, and read/write single-threaded.
 import json
 import logging
 import re
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import accumulate, product
 from pathlib import Path
@@ -37,7 +36,13 @@ import zarr
 from tqdm import tqdm
 
 from spadlib.processing import correct_hotpixels_conv, thin_events_uniform, thin_frames_uniform
-from spadlib.utils import dot_clean_dir, is_json_serializable, make_json_serializable, natural_sort_key
+from spadlib.utils import (
+    _ignore_dotfiles,
+    dot_clean_dir,
+    is_json_serializable,
+    make_json_serializable,
+    natural_sort_key,
+)
 
 try:
     import cupy as cp
@@ -318,28 +323,6 @@ def _open_hdf5_frames(path):
         f.close()
         raise KeyError(f"No frames dataset found in {path}. Available datasets: {keys}")
     return f["frames"]
-
-
-# ---------------------------------------------------------------------------
-# Generic directory helpers
-# ---------------------------------------------------------------------------
-def _ignore_dotfiles(paths):
-    """
-    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
-    listing, warning about any that were found.
-    """
-    kept, dotfiles = [], []
-    for p in paths:
-        (dotfiles if p.name.startswith(".") else kept).append(p)
-    if dotfiles:
-        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
-        # dot_clean only exists on macOS, so only suggest it there
-        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
-        logger.warning(
-            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
-            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
-        )
-    return kept
 
 
 # ---------------------------------------------------------------------------

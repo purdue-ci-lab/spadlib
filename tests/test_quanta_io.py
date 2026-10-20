@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import zarr
 
-import spadlib.io as io
+import spadlib.utils as utils
 
 from spadlib.io import (
     read_quanta_auto,
@@ -98,7 +98,7 @@ def test_mat_dir_ignores_dotfiles(mat_dir, frames, caplog):
 @pytest.mark.parametrize("platform, expect_hint", [("darwin", True), ("linux", False)])
 def test_dotfile_warning_only_suggests_dot_clean_on_macos(bin_dir, monkeypatch, caplog, platform, expect_hint):
     """`dot_clean` is a macOS-only command."""
-    monkeypatch.setattr(io.sys, "platform", platform)
+    monkeypatch.setattr(utils.sys, "platform", platform)
     _add_dotfiles(bin_dir, ["._RAW00000.bin"])
     with caplog.at_level(logging.WARNING):
         read_quanta_dir(bin_dir, H=H, W=W)
