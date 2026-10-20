@@ -1561,32 +1561,89 @@ class QuantaGatedDir:
 
 def _check_quanta_gated(quanta_gated):
     """
-    Raise a TypeError unless `quanta_gated` is a :class:`QuantaGatedDir` (e.g. a path to
-    the image directory was passed instead).
+    Raise unless `quanta_gated` is a :class:`QuantaGatedDir` or a 4D array (e.g. a path
+    to the image directory was passed instead).
     """
-    if not isinstance(quanta_gated, QuantaGatedDir):
+    if isinstance(quanta_gated, QuantaGatedDir):
+        return
+    if isinstance(quanta_gated, (str, Path)) or not hasattr(quanta_gated, "shape"):
         if isinstance(quanta_gated, (str, Path)):
             hint = f"QuantaGatedDir({str(quanta_gated)!r})"
         else:
             hint = "QuantaGatedDir(image_dir, ...)"
         raise TypeError(
-            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
-            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
-            f"alongside the images."
+            f"quanta_gated must be a QuantaGatedDir or a 4D (n_frames, n_gate_steps, "
+            f"image_height, image_width) array, not {type(quanta_gated).__name__}. To write "
+            f"an image directory, build the reader first, e.g. {hint}, so the acquisition "
+            f"metadata is written alongside the images."
+        )
+    if len(quanta_gated.shape) != 4:
+        raise ValueError(
+            f"quanta_gated must be a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"array, got shape {quanta_gated.shape}"
         )
 
 
 def _quanta_gated_attrs(quanta_gated, attrs=None):
     """
-    Attributes stored by the ``write_quanta_gated_*`` writers: the acquisition metadata
-    plus `attrs` merged over it.
+    Attributes stored by the ``write_quanta_gated_*`` writers.
+
+    For a :class:`QuantaGatedDir`, its acquisition metadata plus `attrs` merged over it.
+    An array carries no metadata beyond its shape and dtype, so the rest comes from
+    `attrs` (e.g. the metadata read back from another gated file); the geometry is always
+    taken from the array's shape, with a warning if `attrs` disagrees.
     """
-    return {
-        **quanta_gated.metadata,
-        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
-        "source_dir": str(quanta_gated.path),
-        **(attrs or {}),
+    if isinstance(quanta_gated, QuantaGatedDir):
+        return {
+            **quanta_gated.metadata,
+            "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+            "source_dir": str(quanta_gated.path),
+            **(attrs or {}),
+        }
+    attrs = attrs or {}
+    n_frames, n_gate_steps, image_height, image_width = quanta_gated.shape
+    geometry = {
+        "n_frames": n_frames,
+        "n_gate_steps": n_gate_steps,
+        "image_height": image_height,
+        "image_width": image_width,
     }
+    for key, value in geometry.items():
+        if key in attrs and attrs[key] != value:
+            warnings.warn(
+                f"attrs has {key}={attrs[key]}, but the array has {key}={value}; "
+                f"using the array's.",
+                stacklevel=3,  # point at the caller of the writer
+            )
+    return {
+        # same default as QuantaGatedDir: the storage bit depth
+        "image_bit_depth": np.dtype(quanta_gated.dtype).itemsize * 8,
+        **attrs,
+        **geometry,
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+    }
+
+
+def _quanta_gated_chunk_slices(n_frames, n_gate_steps, frames_per_chunk):
+    """
+    ``(frame_slice, gate_idx)`` of every (frames_per_chunk, 1, H, W) chunk of a gated
+    acquisition.
+    """
+    return [
+        (slice(start, min(start + frames_per_chunk, n_frames)), gate_idx)
+        for gate_idx in range(n_gate_steps)
+        for start in range(0, n_frames, frames_per_chunk)
+    ]
+
+
+def _read_quanta_gated_chunk(quanta_gated, frame_slice, gate_idx):
+    """
+    Read one gate step's run of frames, (n_frames_in_chunk, image_height, image_width),
+    from a :class:`QuantaGatedDir` or a 4D array.
+    """
+    if isinstance(quanta_gated, QuantaGatedDir):
+        return quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+    return np.asarray(quanta_gated[frame_slice, gate_idx])
 
 
 def write_quanta_gated_zarr(
@@ -1605,27 +1662,39 @@ def write_quanta_gated_zarr(
     metadata stored as array attributes.
 
     Images are read and written chunk-by-chunk, so the full acquisition is never
-    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
-    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
-    summing over frames) touch whole chunks.
+    held in memory (unless it is passed in as a numpy array). Chunks are
+    (frames_per_chunk, 1, image_height, image_width), i.e. a run of frames for a single
+    gate step, so that per-gate-step reductions (e.g. summing over frames) touch whole
+    chunks.
+
+    To convert from HDF5, pass the lazy dataset and its metadata::
+
+        frames, meta = read_quanta_gated_hdf5("gated.h5", return_meta=True)
+        write_quanta_gated_zarr("gated.zarr", frames, attrs=meta)
 
     Args:
         path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
-        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
-            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
-            acquisition metadata is attached.
+        quanta_gated (QuantaGatedDir or array): the acquisition to write: either a
+            :class:`QuantaGatedDir` (the reader object, not a path), whose acquisition
+            metadata is written along with the images, or a 4D (n_frames,
+            n_gate_steps, image_height, image_width) numpy/zarr/h5py array, whose
+            metadata comes from `attrs`.
         frames_per_chunk (int or None): frames per chunk along the frame axis; if
             None, the largest number that keeps a chunk under `max_chunk_bytes`.
         max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
         compressor (codec or None): codec for compression (default: bitshuffle for
             8-bit data, else shuffle).
         attrs (dict or None): extra attributes, merged over the acquisition metadata.
+            For an array, the acquisition metadata itself; the geometry
+            (``n_frames`` etc.) is always taken from the array's shape.
         n_workers (int): number of worker threads reading/writing chunks concurrently.
+            Ignored (one thread) when `quanta_gated` is an h5py dataset.
         overwrite (bool): if True, overwrite an existing zarr at `path`.
 
     Raises:
-        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
-            the image directory was passed instead).
+        TypeError: if `quanta_gated` is neither a :class:`QuantaGatedDir` nor an array
+            (e.g. a path to the image directory was passed instead).
+        ValueError: if `quanta_gated` is an array that is not 4D.
 
     Returns:
         The written zarr array.
@@ -1634,9 +1703,12 @@ def write_quanta_gated_zarr(
     path = Path(path)
     n_frames, n_gate_steps, height, width = quanta_gated.shape
     if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+        frame_nbytes = height * width * np.dtype(quanta_gated.dtype).itemsize
+        frames_per_chunk = _frames_per_chunk(n_frames, frame_nbytes, max_chunk_bytes)
     if compressor is None:
         compressor = _default_compressor(quanta_gated.dtype)
+    if isinstance(quanta_gated, h5py.Dataset):
+        n_workers = 1  # never read an HDF5 file from multiple threads
 
     def _create():
         return zarr.create_array(
@@ -1657,16 +1729,11 @@ def write_quanta_gated_zarr(
     for key, value in _quanta_gated_attrs(quanta_gated, attrs).items():
         ds.attrs[key] = make_json_serializable(value)
 
-    tasks = [
-        (start, gate_idx)
-        for gate_idx in range(n_gate_steps)
-        for start in range(0, n_frames, frames_per_chunk)
-    ]
+    tasks = _quanta_gated_chunk_slices(n_frames, n_gate_steps, frames_per_chunk)
 
     def write_chunk(task):
-        start, gate_idx = task
-        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
-        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+        frame_slice, gate_idx = task
+        ds[frame_slice, gate_idx] = _read_quanta_gated_chunk(quanta_gated, frame_slice, gate_idx)
 
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
@@ -1689,26 +1756,37 @@ def write_quanta_gated_hdf5(
     :func:`write_quanta_gated_zarr` stores on its array).
 
     Images are read and written one chunk at a time, so the full acquisition is never
-    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), as in
+    held in memory (unless it is passed in as a numpy array). Chunks are
+    (frames_per_chunk, 1, image_height, image_width), as in
     :func:`write_quanta_gated_zarr`.
+
+    To convert from Zarr, pass the lazy array and its metadata::
+
+        frames, meta = read_quanta_gated_zarr("gated.zarr", return_meta=True)
+        write_quanta_gated_hdf5("gated.h5", frames, attrs=meta)
 
     Args:
         path (str or Path): path to the output HDF5 file (e.g. "gated.h5").
-        quanta_gated (QuantaGatedDir): the acquisition to write (the reader object, not
-            a path).
+        quanta_gated (QuantaGatedDir or array): the acquisition to write: a
+            :class:`QuantaGatedDir` or a 4D numpy/zarr/h5py array (see
+            :func:`write_quanta_gated_zarr`).
         frames_per_chunk (int or None): frames per chunk along the frame axis; if
             None, the largest number that keeps a chunk under `max_chunk_bytes`.
         max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
         attrs (dict or None): extra attributes, merged over the acquisition metadata.
+            For an array, the acquisition metadata itself; the geometry
+            (``n_frames`` etc.) is always taken from the array's shape.
         overwrite (bool): if True, overwrite an existing file at `path`.
 
     Raises:
-        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir`.
+        TypeError: if `quanta_gated` is neither a :class:`QuantaGatedDir` nor an array.
+        ValueError: if `quanta_gated` is an array that is not 4D.
     """
     _check_quanta_gated(quanta_gated)
-    n_frames, _, height, width = quanta_gated.shape
+    n_frames, n_gate_steps, height, width = quanta_gated.shape
     if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+        frame_nbytes = height * width * np.dtype(quanta_gated.dtype).itemsize
+        frames_per_chunk = _frames_per_chunk(n_frames, frame_nbytes, max_chunk_bytes)
 
     with h5py.File(path, "w" if overwrite else "w-") as f:
         ds = f.create_dataset(
@@ -1719,8 +1797,9 @@ def write_quanta_gated_hdf5(
             **HDF5_COMPRESSION,
         )
         _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
-        for frame_slice, gate_idx, block in quanta_gated.iter_chunks(frames_per_chunk):
-            ds[frame_slice, gate_idx] = block
+        tasks = _quanta_gated_chunk_slices(n_frames, n_gate_steps, frames_per_chunk)
+        for frame_slice, gate_idx in tqdm(tasks, desc="Writing gated frames"):
+            ds[frame_slice, gate_idx] = _read_quanta_gated_chunk(quanta_gated, frame_slice, gate_idx)
     logger.info(f"Saved gated quanta to HDF5 at: {path}")
 
 

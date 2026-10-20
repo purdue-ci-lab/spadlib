@@ -15,6 +15,7 @@ from spadlib.io import (
     read_async_spad_zarr,
     read_quanta_auto,
     read_quanta_gated_hdf5,
+    read_quanta_gated_zarr,
     read_quanta_hdf5,
     read_quanta_zarr,
     write_async_spad_hdf5,
@@ -216,6 +217,80 @@ def test_write_quanta_gated_hdf5_rejects_a_path(tmp_path, gated_dir_path):
     with pytest.raises(TypeError, match="must be a QuantaGatedDir"):
         write_quanta_gated_hdf5(out, gated_dir_path)
     assert not out.exists()
+
+
+@pytest.fixture
+def gated_zarr_path(tmp_path, gated_dir_path):
+    gd = QuantaGatedDir(gated_dir_path, integration_time_ms=1.0, gate_width_ns=6.0)
+    path = tmp_path / "gated.zarr"
+    write_quanta_gated_zarr(path, gd, attrs={"note": "x"}, n_workers=2)
+    return path
+
+
+def test_quanta_gated_zarr_to_hdf5(tmp_path, gated_zarr_path, images):
+    frames, meta = read_quanta_gated_zarr(gated_zarr_path, return_meta=True)
+    path = tmp_path / "converted.h5"
+    write_quanta_gated_hdf5(path, frames, attrs=meta)
+
+    converted, converted_meta = read_quanta_gated_hdf5(path, load_data=True, return_meta=True)
+    np.testing.assert_array_equal(converted, images)
+    assert converted_meta == meta
+
+
+def test_quanta_gated_hdf5_to_zarr(tmp_path, gated_dir_path, images):
+    gd = QuantaGatedDir(gated_dir_path, integration_time_ms=1.0, gate_width_ns=6.0)
+    h5_path = tmp_path / "gated.h5"
+    write_quanta_gated_hdf5(h5_path, gd)
+
+    frames, meta = read_quanta_gated_hdf5(h5_path, return_meta=True)
+    path = tmp_path / "converted.zarr"
+    write_quanta_gated_zarr(path, frames, attrs=meta, frames_per_chunk=1)
+
+    converted, converted_meta = read_quanta_gated_zarr(path, load_data=True, return_meta=True)
+    np.testing.assert_array_equal(converted, images)
+    assert converted_meta == meta
+
+
+@pytest.mark.parametrize("writer, reader, ext", [
+    (write_quanta_gated_zarr, read_quanta_gated_zarr, ".zarr"),
+    (write_quanta_gated_hdf5, read_quanta_gated_hdf5, ".h5"),
+])
+def test_quanta_gated_write_array(tmp_path, images, writer, reader, ext):
+    path = tmp_path / f"array{ext}"
+    writer(path, images, attrs={"integration_time_ms": 1.0, "source_dir": "elsewhere"})
+    frames, meta = reader(path, load_data=True, return_meta=True)
+    np.testing.assert_array_equal(frames, images)
+    assert meta == {
+        "n_frames": N_FRAMES,
+        "n_gate_steps": N_GATE_STEPS,
+        "image_height": HEIGHT,
+        "image_width": WIDTH,
+        "image_bit_depth": 8,  # storage bit depth, as QuantaGatedDir defaults to
+        "integration_time_ms": 1.0,
+        "source_dir": "elsewhere",
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+    }
+
+
+@pytest.mark.parametrize("writer", [write_quanta_gated_zarr, write_quanta_gated_hdf5])
+def test_quanta_gated_write_array_geometry_from_shape(tmp_path, images, writer):
+    """Metadata from a bigger acquisition doesn't describe a slice of it."""
+    path = tmp_path / "sliced"
+    with pytest.warns(UserWarning, match="n_frames=99") as record:
+        writer(path, images[:2], attrs={"n_frames": 99, "image_bit_depth": 12})
+    assert record[0].filename == __file__
+    reader = read_quanta_gated_zarr if writer is write_quanta_gated_zarr else read_quanta_gated_hdf5
+    _, meta = reader(path, return_meta=True)
+    assert meta["n_frames"] == 2
+    assert meta["image_bit_depth"] == 12
+
+
+@pytest.mark.parametrize("writer", [write_quanta_gated_zarr, write_quanta_gated_hdf5])
+def test_quanta_gated_write_rejects_non_4d_and_non_arrays(tmp_path, images, writer):
+    with pytest.raises(ValueError, match="4D"):
+        writer(tmp_path / "3d", images[0])
+    with pytest.raises(TypeError, match="must be a QuantaGatedDir or a 4D"):
+        writer(tmp_path / "list", images.tolist())
 
 
 def test_read_quanta_gated_hdf5_rejects_wrong_ndim(tmp_path, frames):
