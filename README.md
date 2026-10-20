@@ -60,8 +60,23 @@ vio.write_video(
 
 hotpixel_corrected_frames = spproc.correct_hotpixels(frames[:])
 
-spio.write_quanta_zarr("path/to/hotpixcorrected.zarr", hotpixel_corrected_frames, fps=56_000)
+# convert to HDF5, which is quicker to read, has metadata, and stores compressed
+spio.write_quanta_hdf5("path/to/hotpixcorrected.h5", hotpixel_corrected_frames, fps=56_000)
 ```
+
+## Data file formats
+
+The file format that the sensors spit out (`.bin` files, etc) are uncompressed and awful, so
+for our purposes we standardize it as other formats.
+
+HDF5 (`.h5`, `.hdf5`) is now my preferred format to convert these files, since it is
+compressed, fits into a single file, and stores metadata.
+
+Previously we used Zarr files, which were also great for compression and metadata but
+unfortunately it splits chunks into many files which plays poorly with file sharing.
+
+This library can read and convert between the sensor output formats and the
+alternative HDF5 and Zarr formats.
 
 ## Contributing
 
