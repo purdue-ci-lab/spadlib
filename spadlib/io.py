@@ -321,8 +321,710 @@ def _open_hdf5_frames(path):
 
 
 # ---------------------------------------------------------------------------
-# SPAD writers
+# Generic directory helpers
 # ---------------------------------------------------------------------------
+def _ignore_dotfiles(paths):
+    """
+    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
+    listing, warning about any that were found.
+    """
+    kept, dotfiles = [], []
+    for p in paths:
+        (dotfiles if p.name.startswith(".") else kept).append(p)
+    if dotfiles:
+        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
+        # dot_clean only exists on macOS, so only suggest it there
+        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
+        logger.warning(
+            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
+            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
+        )
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# Quanta data: (T, H, W) synchronous binary/count frames
+# ---------------------------------------------------------------------------
+def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
+    """
+    Cast quanta frames to uint8 and compute the metadata stored by the
+    ``write_quanta_*`` writers (see :func:`write_quanta_zarr`).
+
+    Returns:
+        tuple: ``(frames, attrs)``.
+    """
+    if T_exp is None:
+        if fps is not None:
+            T_exp = frames.shape[0] / fps
+        else:
+            raise ValueError("Either T_exp or fps must be provided")
+    elif fps is not None and T_exp is not None:
+        raise ValueError("Only one of T_exp or fps should be provided")
+    elif T_exp is not None and fps is None:
+        fps = frames.shape[0] / T_exp
+    frames = np.asarray(frames, dtype="uint8")
+    npoints = np.count_nonzero(frames)
+    npts_persec_perpix = np.count_nonzero(frames, axis=0) / T_exp
+    # statistics
+    avg_pts_persec_perpixel = npoints / (T_exp * frames.shape[1] * frames.shape[2])
+    max_pts_persec_perpixel = np.max(npts_persec_perpix)
+    min_pts_persec_perpixel = np.min(npts_persec_perpix)
+    med_pts_persec_perpixel = np.median(npts_persec_perpix)
+    stddev_pts_persec_perpixel = np.std(npts_persec_perpix, ddof=1)
+    fps = fps or (frames.shape[0] / T_exp)
+    attrs = {
+        "fps": fps,
+        "T_exp": T_exp,
+        "T": frames.shape[0],
+        "H": frames.shape[1],
+        "W": frames.shape[2],
+        "shape": "(T, H, W)",
+        "npoints": npoints,
+        "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
+        "max_pts_persec_perpixel": max_pts_persec_perpixel,
+        "min_pts_persec_perpixel": min_pts_persec_perpixel,
+        "med_pts_persec_perpixel": med_pts_persec_perpixel,
+        "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
+    }
+    return frames, attrs
+
+
+class LazyQuantaFrames:
+    """
+    Lazy ``(T, H, W)`` quanta frames backed by one or more ``.bin``/``.mat`` files,
+    concatenated along T in the given order. Returned by the ``.bin``/``.mat``/directory
+    quanta readers when ``load_data=False``.
+
+    Only file sizes/headers are read at construction. Frames are read from disk when
+    indexed, and only from the files the index touches. SPAD512 ``.bin`` and MATLAB v7.3
+    (HDF5) files are read partially; MATLAB v7/v7.2 files can only be loaded whole, so
+    each index that touches one loads that entire file.
+
+    Only integer and slice indexing (optionally with ``...``) is supported, with numpy
+    semantics; the result is a numpy array.
+
+    Args:
+        files: ``_QuantaBinFile``/``_QuantaMatFile`` objects, all with the same frame shape.
+    """
+
+    def __init__(self, files):
+        self._files = list(files)
+        frame_shapes = {f.shape[1:] for f in self._files}
+        if len(frame_shapes) != 1:
+            raise ValueError(f"Files have mismatched frame shapes: {sorted(frame_shapes)}")
+        # index of the first frame of each file within the concatenated frames
+        self._starts = [0, *accumulate(f.n_frames for f in self._files)]
+        self.shape = (self._starts[-1], *frame_shapes.pop())
+        self.dtype = np.result_type(*(f.dtype for f in self._files))
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __repr__(self):
+        return f"{type(self).__name__}(n_files={len(self._files)}, shape={self.shape}, dtype={self.dtype})"
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        for k in key:
+            if not (k is Ellipsis or isinstance(k, slice) or (isinstance(k, (int, np.integer)) and not isinstance(k, bool))):
+                raise TypeError(f"{type(self).__name__} only supports integer and slice indexing, got {k!r}")
+        n_ellipsis = sum(k is Ellipsis for k in key)
+        if n_ellipsis > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        if n_ellipsis:
+            i = next(i for i, k in enumerate(key) if k is Ellipsis)
+            key = key[:i] + (slice(None),) * (self.ndim - len(key) + 1) + key[i + 1:]
+        if len(key) > self.ndim:
+            raise IndexError(f"too many indices for array: array is {self.ndim}-dimensional, but {len(key)} were indexed")
+        spatial_key = (slice(None), *key[1:])
+
+        t_idx = range(self.shape[0])[key[0]]  # int (IndexError if out of range) or range
+        is_int = not isinstance(t_idx, range)
+        t_range = range(t_idx, t_idx + 1) if is_int else t_idx
+        # read in increasing frame order, then flip back
+        reverse = t_range.step < 0
+        if reverse:
+            t_range = t_range[::-1]
+
+        pieces = []
+        for f, start in zip(self._files, self._starts):
+            # the elements of t_range that fall within this file
+            lo = max(0, -(-(start - t_range.start) // t_range.step))
+            hi = max(0, -(-(start + f.n_frames - t_range.start) // t_range.step))
+            sub = t_range[lo:hi]
+            if sub:
+                sel = slice(sub[0] - start, sub[-1] - start + 1, sub.step)
+                pieces.append(f.read(sel)[spatial_key])
+
+        if not pieces:
+            frames = np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key]
+        elif len(pieces) == 1:
+            frames = pieces[0]
+        else:
+            frames = np.concatenate(pieces, axis=0)
+        if reverse:
+            frames = frames[::-1]
+        if not is_int:
+            return frames
+        # like numpy, an all-integer index with an ellipsis gives a 0-d array, not a scalar
+        return frames[0, ...] if n_ellipsis else frames[0]
+
+
+class _QuantaBinFile:
+    """
+    A single SPAD512 packed-bits ``.bin`` file, read as ``(T, W, H)`` frames on demand.
+
+    Ripped from spadtools (https://github.com/lyehe/spadtools).
+    """
+
+    def __init__(self, path, H=512, W=512):
+        self.path = Path(path)
+        self.H = 512 if H is None else H
+        self.W = 512 if W is None else W
+        self._frame_nbytes = self.H * self.W // 8
+        nbytes = self.path.stat().st_size
+        if nbytes % self._frame_nbytes:
+            raise ValueError(
+                f"{self.path.name}: file size ({nbytes} bytes) is not a multiple of the "
+                f"frame size ({self._frame_nbytes} bytes for H={self.H}, W={self.W})"
+            )
+        self.n_frames = nbytes // self._frame_nbytes
+        self.shape = (self.n_frames, self.W, self.H)  # rot90 on read swaps H and W
+        self.dtype = np.dtype(np.uint8)
+
+    def read(self, sel=slice(None)):
+        """Read the frames selected by `sel` (a slice with positive step)."""
+        start, stop, step = sel.indices(self.n_frames)
+        with open(self.path, "rb") as f:
+            f.seek(start * self._frame_nbytes)
+            raw_data = f.read(max(stop - start, 0) * self._frame_nbytes)
+        bits_array = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, self.H, self.W // 8)[::step]
+        frames = np.unpackbits(bits_array, axis=2)
+        return np.rot90(frames, k=1, axes=(1, 2))
+
+
+class _QuantaMatFile:
+    """
+    A single MATLAB ``.mat`` quanta volume stored as ``(H, W, T)``, read as ``(T, H, W)``
+    frames on demand. Only the variable's shape and dtype are read at construction.
+    """
+
+    def __init__(self, path, key=None):
+        self.path = Path(path)
+        self.key, shape, dtype, self._is_hdf5 = _inspect_mat_array(self.path, key=key)
+        if len(shape) != 3:
+            raise ValueError(f"{self.path.name}: expected 3D array, got shape {shape}")
+        self.n_frames = shape[2]
+        self.shape = (shape[2], shape[0], shape[1])
+        self.dtype = np.dtype(dtype)
+
+    def read(self, sel=slice(None)):
+        """Read the frames selected by `sel` (a slice with positive step)."""
+        if self._is_hdf5:
+            import h5py
+            with h5py.File(self.path.as_posix(), "r") as f:
+                arr = f[self.key][:, :, sel]  # only reads the selected frames
+        else:
+            import scipy.io
+            arr = scipy.io.loadmat(self.path.as_posix(), variable_names=[self.key])[self.key][:, :, sel]
+        # (H, W, T) -> (T, H, W)
+        return np.transpose(arr, (2, 0, 1))
+
+
+def _inspect_mat_array(mat_path, key=None):
+    """
+    Find the array to read from a MATLAB ``.mat`` file and get its stored shape and
+    dtype, without loading its data.
+
+    Supports both MATLAB v7/v7.2 files (via ``scipy.io.whosmat``) and v7.3 HDF5-based
+    files (via ``h5py``, imported lazily so it is only required for v7.3 data).
+
+    Args:
+        mat_path (str or Path): Path to the .mat file.
+        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
+            array. If None, expects exactly one 3D array (v7.3) or one non-reserved
+            variable (v7/v7.2) in the file.
+
+    Returns:
+        tuple: (key, shape, dtype, is_hdf5)
+    """
+    mat_path = Path(mat_path)
+
+    # Try scipy first (handles v7/v7.2; raises NotImplementedError for v7.3 files).
+    scipy_error = None
+    try:
+        import scipy.io
+        variables = {name: (shape, cls) for name, shape, cls in scipy.io.whosmat(mat_path.as_posix())}
+        candidates = list(variables)
+        if not candidates:
+            raise ValueError(f"No array variables found in {mat_path.name}")
+        if key is None:
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"{mat_path.name}: multiple variables found {candidates}. "
+                    f"Specify one with key=."
+                )
+            key_use = candidates[0]
+        else:
+            if key not in variables:
+                raise KeyError(f"{mat_path.name}: key '{key}' not found. Available: {candidates}")
+            key_use = key
+        shape, cls = variables[key_use]
+        # MATLAB class names match numpy dtype names, except logical (loaded as uint8)
+        return key_use, shape, np.dtype(np.uint8 if cls == "logical" else cls), False
+    except NotImplementedError:
+        pass  # v7.3 file; fall through to h5py
+    except Exception as e:
+        scipy_error = e
+
+    # Try h5py (v7.3 / HDF5-backed .mat).
+    try:
+        import h5py
+        with h5py.File(mat_path.as_posix(), "r") as f:
+            if key is None:
+                datasets = []
+
+                def _visit(name, obj):
+                    if hasattr(obj, "shape") and hasattr(obj, "dtype") and len(getattr(obj, "shape", ())) == 3:
+                        datasets.append(name)
+
+                f.visititems(_visit)
+                if not datasets:
+                    raise ValueError(f"{mat_path.name}: no 3D datasets found (v7.3).")
+                if len(datasets) != 1:
+                    raise ValueError(
+                        f"{mat_path.name}: multiple 3D datasets found {datasets}. "
+                        f"Specify one with key= (use full path inside the .mat)."
+                    )
+                key_use = datasets[0]
+            else:
+                key_use = key
+                if key_use not in f:
+                    raise KeyError(f"{mat_path.name}: dataset '{key_use}' not found in v7.3 file.")
+            ds = f[key_use]
+            return key_use, ds.shape, ds.dtype, True
+    except Exception as e:
+        if scipy_error is not None:
+            raise RuntimeError(
+                f"Failed to load {mat_path.name} with scipy ({scipy_error}) and h5py ({e})."
+            ) from e
+        raise
+
+
+def _read_mat_meta(path):
+    """
+    Read the optional MATLAB-volume metadata sidecar from a directory.
+
+    Looks for ``info.json`` first, then falls back to any single ``*.json`` file. The
+    JSON is expected to carry ``no_frames_total``, ``no_parts`` and ``no_frames`` keys
+    (as produced by the concat-to-zarr tooling) but any/all may be absent.
+
+    Returns:
+        dict or None: parsed metadata, or None if no readable sidecar is found.
+    """
+    path = Path(path)
+    meta_path = path / "info.json"
+    if not meta_path.is_file():
+        candidates = sorted(_ignore_dotfiles(path.glob("*.json")))
+        if not candidates:
+            return None
+        meta_path = candidates[0]
+    try:
+        return json.loads(meta_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not parse metadata file {meta_path.name}: {e}")
+        return None
+
+
+def _read_quanta_mat_dir(path, matpaths, key=None, load_data=False):
+    """
+    Read and concatenate a directory of MATLAB ``.mat`` quanta volumes into ``(T, H, W)``.
+
+    Files are read in the caller-provided (natural sorted) order and concatenated along
+    T. If an ``info.json`` sidecar is present, its ``no_parts``/``no_frames_total`` are
+    used to validate the result (mismatches are logged as warnings, not fatal).
+    """
+    meta = _read_mat_meta(path)
+    no_parts = meta.get("no_parts") if meta else None
+    if no_parts is not None and len(matpaths) != int(no_parts):
+        logger.warning(f"Metadata says no_parts={no_parts}, but found {len(matpaths)} .mat files.")
+
+    files = [_QuantaMatFile(f, key=key) for f in matpaths]
+    frames = LazyQuantaFrames(files)
+
+    no_frames_total = meta.get("no_frames_total") if meta else None
+    if no_frames_total is not None and frames.shape[0] != int(no_frames_total):
+        logger.warning(
+            f"Metadata says no_frames_total={no_frames_total}, but found {frames.shape[0]} frames."
+        )
+    if not load_data:
+        return frames
+    return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
+
+
+def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
+    """
+    Write binary quanta frames to a Zarr group.
+
+    Originally write_quantaframes_zarr, then write_frames_zarr.
+
+    Args:
+        path (str or Path): Path to the output Zarr file.
+        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
+        T_exp (float): exposure time in seconds.
+        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+        n_workers (int): number of worker threads writing arrays concurrently.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
+    max_chunk_bytes = 200_000_000
+    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
+    quantadata = {
+        "frames": frames
+    }
+    chunks = {
+        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
+    }
+    compressors = {
+        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+    }
+    save_arrs_to_zarr(
+        quantadata, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=True,
+        attrs=attrs,
+        compressor_dict=compressors,
+    )
+
+
+def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
+    """
+    Write binary quanta frames to an HDF5 file.
+
+    Same array and metadata as :func:`write_quanta_zarr`: a ``frames`` dataset at the
+    root of the file, with the metadata as root attributes.
+
+    Args:
+        path (str or Path): Path to the output HDF5 file.
+        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
+        T_exp (float): exposure time in seconds.
+        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frames_per_chunk = _frames_per_chunk(
+        frames.shape[0], frames.shape[1] * frames.shape[2], HDF5_MAX_CHUNK_BYTES
+    )
+    _save_arrs_to_hdf5(
+        {"frames": frames}, path,
+        chunks={"frames": (frames_per_chunk, frames.shape[1], frames.shape[2])},
+        attrs=attrs,
+    )
+
+
+def read_quanta_bin(path, H=512, W=512, load_data=False):
+    """
+    Read a single binary SPAD512 file.
+
+    Args:
+        load_data (bool): if True, read the whole file into memory as a numpy array. If
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
+
+    Ripped from spadtools (https://github.com/lyehe/spadtools).
+    """
+    frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
+    return frames[:] if load_data else frames
+
+
+def read_quanta_mat(path, key=None, load_data=False):
+    """
+    Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
+    (consistent with :func:`read_quanta_bin`).
+
+    The volume is assumed to be stored as ``(H, W, T)`` (MATLAB WxHxT convention) and is
+    transposed to ``(T, H, W)`` on read. Dtype is preserved from the file.
+
+    Args:
+        path (str or Path): Path to the .mat file.
+        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
+            volume. If None, expects exactly one 3D array in the file.
+        load_data (bool): if True, read the whole volume into memory as a numpy array. If
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
+    """
+    frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
+    return frames[:] if load_data else frames
+
+
+def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
+    """
+    Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
+    array.
+
+    Two directory layouts are supported (detected automatically):
+
+    - **SPAD512 binary**: ``*.bin`` files; frame dimensions are given by ``H``, ``W``,
+      read in natural sorted order.
+    - **MATLAB volumes**: ``*.mat`` files, each a ``(H, W, T)`` volume, read in natural
+      sorted order (e.g. ``part2.mat`` before ``part10.mat``) and concatenated along T.
+      An optional ``info.json`` sidecar (with ``no_frames_total``, ``no_parts``,
+      ``no_frames``) is used to validate the result if present.
+
+    Args:
+        H, W (int): Height and width of the frames where it cannot be inferred (e.g.
+            SPAD512 .bin files). Ignored for .mat files, where they are inferred.
+        key (str or None): For .mat files, the variable/dataset name holding the volume.
+            If None, expects exactly one 3D array per file.
+        load_data (bool): if True, read all files into memory as a numpy array. If False
+            (default), return a :class:`LazyQuantaFrames` over all files that reads frames when
+            indexed.
+    """
+    path = Path(path)
+    if not path.is_dir():
+        raise FileNotFoundError(f"Path {path} is not a directory")
+
+    binpaths = sorted(_ignore_dotfiles(path.glob("*.bin")), key=lambda p: natural_sort_key(p.name))
+    if binpaths:
+        try:
+            files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
+            frames = LazyQuantaFrames(files)
+        except ValueError as e:
+            logger.error(f"Error reading the .bin files in {path}, likely due to a truncated or non-SPAD512 file in the directory.")
+            raise e
+        if not load_data:
+            return frames
+        return np.concatenate([f.read() for f in tqdm(files, desc="Reading .bin files from directory")], axis=0)
+
+    matpaths = sorted(_ignore_dotfiles(path.glob("*.mat")), key=lambda p: natural_sort_key(p.name))
+    if matpaths:
+        return _read_quanta_mat_dir(path, matpaths, key=key, load_data=load_data)
+
+    raise FileNotFoundError(f"No *.bin or *.mat files found in {path}")
+
+
+def read_quanta_zarr(path, load_data=False, return_meta=False):
+    """
+    Read quanta frames from a Zarr v3 group.
+
+    Works with:
+      - "original" QuantaBurst zarr (frames/quantaframes + rich attrs)
+      - your concatenated zarr (data + different attrs)
+
+    Args:
+        path (str or Path): path to the Zarr group.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy zarr array.
+        return_meta (bool): if True, also return the group attributes.
+
+    Returns:
+        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
+        return_meta=True.
+    """
+    zarrdata = zarr.open_group(str(path), mode="r")
+
+    # Zarr v3 safe listing of arrays
+    keys = set(zarrdata.array_keys())
+
+    # Accept multiple possible dataset names
+    candidate_keys = ("frames", "quantaframes", "data")
+    framekey = next((k for k in candidate_keys if k in keys), None)
+    if framekey is None:
+        raise KeyError(
+            f"No frames array found in {path}. "
+            f"Available arrays: {sorted(keys)}"
+        )
+
+    frames = zarrdata[framekey]
+    if load_data:
+        frames = frames[:]
+
+    # attrs differ between the two formats; just return them as-is
+    return (frames, dict(zarrdata.attrs)) if return_meta else frames
+
+
+def read_quanta_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read quanta frames from an HDF5 file written by :func:`write_quanta_hdf5`.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy h5py dataset, which keeps the file open
+            (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the root attributes.
+
+    Returns:
+        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
+        return_meta=True.
+    """
+    frames = _open_hdf5_frames(path)
+    attrs = _get_hdf5_attrs(frames.file)
+    if load_data:
+        f = frames.file
+        frames = frames[:]
+        f.close()
+    return (frames, attrs) if return_meta else frames
+
+
+def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
+    """
+    Automatically detects the format of the input path and reads the quanta data accordingly:
+    a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
+
+    Args:
+        load_data (bool): If True, load the data into memory. If False (default), returns
+            lazy data if supported.
+        return_meta (bool): If True, also return the metadata (None for formats that
+            carry none).
+        H, W (int): Height and width of the frames where it cannot be inferred (e.g. SPAD512 .bin files).
+            Otherwise, these are ignored and inferred from data.
+        key (str or None): For .mat inputs, the variable/dataset name holding the volume.
+            If None, expects exactly one 3D array per file.
+
+    Returns:
+        quantaframes: array of shape (T, H, W) with binary frames, lazy unless
+        load_data=True; or ``(quantaframes, metadata)`` if return_meta=True, where
+        metadata is a dict of the relevant metadata if available, else None.
+    """
+    path = Path(path)
+    if path.suffix == ".zarr":
+        logger.info(f"Reading quanta from Zarr file: {path}")
+        frames, metadata = read_quanta_zarr(path, load_data=load_data, return_meta=True)
+        return (frames, metadata) if return_meta else frames
+    elif path.suffix == ".bin":
+        logger.info(f"Reading quanta from binary file: {path}")
+        frames = read_quanta_bin(path, H=H, W=W, load_data=load_data)
+    elif path.suffix == ".mat":
+        logger.info(f"Reading quanta from MATLAB file: {path}")
+        frames = read_quanta_mat(path, key=key, load_data=load_data)
+    else:
+        # otherwise, assume it's a directory of .bin or .mat files
+        logger.info(f"Reading quanta from directory of quanta files: {path}")
+        frames = read_quanta_dir(path, H=H, W=W, key=key, load_data=load_data)
+    return (frames, None) if return_meta else frames
+
+
+# ---------------------------------------------------------------------------
+# Async SPAD data: asynchronous per-pixel photon timestamps
+# ---------------------------------------------------------------------------
+def _async_spad_arrays(pixel_timeseries, T_exp=None, attrs=None):
+    """
+    Flatten per-pixel timestamps into the arrays and metadata stored by the
+    ``write_async_spad_*`` writers (see :func:`write_async_spad_zarr`).
+
+    Returns:
+        tuple: ``(data, metadata)``, where `data` maps ``t``/``y``/``x``/``offsets``/
+        ``lengths`` to numpy arrays.
+    """
+    H = len(pixel_timeseries)
+    W = len(pixel_timeseries[0])
+    if any(len(row) != W for row in pixel_timeseries):
+        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
+
+    lengths = np.zeros((H, W), dtype="int64")
+    flat_list = []
+    for i in range(H):
+        for j in range(W):
+            arr = pixel_timeseries[i][j]
+            arr = np.asarray([] if arr is None else arr, dtype="float64")
+            lengths[i, j] = arr.size
+            flat_list.append(arr)
+    # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
+    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
+    t = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
+
+    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
+    x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
+
+    if T_exp is None:
+        if t.size == 0:
+            raise ValueError(
+                "T_exp cannot be inferred from an acquisition with no photons; pass T_exp."
+            )
+        T_exp = float(t.max())
+
+    pixel_photon_rates = lengths / T_exp
+    data = {
+        "t": t,
+        "y": y,
+        "x": x,
+        "offsets": offsets,
+        "lengths": lengths,
+    }
+    metadata = {
+        "T_exp": T_exp,
+        "H": H,
+        "W": W,
+        "shape": "(H, W)",
+        "npoints": int(t.size),
+        "avg_pts_persec_perpixel": np.mean(pixel_photon_rates),
+        "max_pts_persec_perpixel": np.max(pixel_photon_rates),
+        "min_pts_persec_perpixel": np.min(pixel_photon_rates),
+        "med_pts_persec_perpixel": np.median(pixel_photon_rates),
+        "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
+        **(attrs or {}),
+    }
+    return data, metadata
+
+
+def _read_async_spad_arrays(root, load_data=False):
+    """
+    Read the ``(t, y, x)`` events and per-pixel timestamps from a Zarr group or h5py file
+    laid out by the ``write_async_spad_*`` writers.
+    """
+    # can't really lazily load this data
+    timestamps = root["t"][:]
+    offsets = root["offsets"][:]
+    lengths = root["lengths"][:]
+
+    H, W = offsets.shape
+    pixel_timeseries = [[None for _ in range(W)] for _ in range(H)]
+
+    for i in range(H):
+        for j in range(W):
+            start = offsets[i, j]
+            length = lengths[i, j]
+            pixel_timeseries[i][j] = timestamps[start: start + length]
+    # t is already in memory for the per-pixel slicing above
+    t = timestamps if load_data else root["t"]
+    y, x = root["y"], root["x"]
+    if load_data:
+        y = y[:]
+        x = x[:]
+    return (t, y, x), pixel_timeseries
+
+
+# Piccolo 32x32 sensor: photon arrival is a coarse counter tick minus a fine counter
+# tick, and the coarse counter is 16 bits wide, so it wraps every PICCOLO_ROLLOVER_S.
+PICCOLO_COARSE_TICK_S = 6.25e-9
+PICCOLO_FINE_TICK_S = 50e-12
+PICCOLO_ROLLOVER_S = 2**16 * PICCOLO_COARSE_TICK_S
+
+
+def _find_piccolo_timestamp_mats(dirpath):
+    """
+    Return ``(indices, paths)`` for every ``timestamps_{n}.mat`` in `dirpath`, sorted by
+    the integer n. The index is not zero-padded on disk, so a plain string sort would be
+    wrong (``timestamps_10.mat`` before ``timestamps_2.mat``).
+    """
+    dirpath = Path(dirpath)
+    pat = re.compile(r"^timestamps_(\d+)\.mat$")
+    found = {}
+    for f in dirpath.iterdir():
+        m = pat.match(f.name)
+        if m:
+            found[int(m.group(1))] = f
+    if not found:
+        raise FileNotFoundError(f"No timestamps_*.mat files found in {dirpath}")
+    idxs = sorted(found)  # numeric (natural) order
+    return idxs, [found[i] for i in idxs]
+
+
 def write_async_spad_npys(pixel_timeseries, output_dir):
     """
     Save a list of lists of pixel timeseries to .npy files, where pixel_timeseries[y][x] is an array of timestamps for that pixel.
@@ -395,67 +1097,6 @@ def write_async_spad_zarr(
     )
 
 
-def _async_spad_arrays(pixel_timeseries, T_exp=None, attrs=None):
-    """
-    Flatten per-pixel timestamps into the arrays and metadata stored by the
-    ``write_async_spad_*`` writers (see :func:`write_async_spad_zarr`).
-
-    Returns:
-        tuple: ``(data, metadata)``, where `data` maps ``t``/``y``/``x``/``offsets``/
-        ``lengths`` to numpy arrays.
-    """
-    H = len(pixel_timeseries)
-    W = len(pixel_timeseries[0])
-    if any(len(row) != W for row in pixel_timeseries):
-        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
-
-    lengths = np.zeros((H, W), dtype="int64")
-    flat_list = []
-    for i in range(H):
-        for j in range(W):
-            arr = pixel_timeseries[i][j]
-            arr = np.asarray([] if arr is None else arr, dtype="float64")
-            lengths[i, j] = arr.size
-            flat_list.append(arr)
-    # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
-    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
-    t = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
-
-    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-    y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
-    x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
-
-    if T_exp is None:
-        if t.size == 0:
-            raise ValueError(
-                "T_exp cannot be inferred from an acquisition with no photons; pass T_exp."
-            )
-        T_exp = float(t.max())
-
-    pixel_photon_rates = lengths / T_exp
-    data = {
-        "t": t,
-        "y": y,
-        "x": x,
-        "offsets": offsets,
-        "lengths": lengths,
-    }
-    metadata = {
-        "T_exp": T_exp,
-        "H": H,
-        "W": W,
-        "shape": "(H, W)",
-        "npoints": int(t.size),
-        "avg_pts_persec_perpixel": np.mean(pixel_photon_rates),
-        "max_pts_persec_perpixel": np.max(pixel_photon_rates),
-        "min_pts_persec_perpixel": np.min(pixel_photon_rates),
-        "med_pts_persec_perpixel": np.median(pixel_photon_rates),
-        "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
-        **(attrs or {}),
-    }
-    return data, metadata
-
-
 def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwrite=True):
     """
     Write asynchronous SPAD data (per-pixel photon timestamps) to an HDF5 file.
@@ -483,278 +1124,6 @@ def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwr
     _save_arrs_to_hdf5(data, path, chunks=chunks, attrs=metadata, overwrite=overwrite)
 
 
-def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
-    """
-    Write binary quanta frames to a Zarr group.
-
-    Originally write_quantaframes_zarr, then write_frames_zarr.
-
-    Args:
-        path (str or Path): Path to the output Zarr file.
-        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
-        T_exp (float): exposure time in seconds.
-        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
-        n_workers (int): number of worker threads writing arrays concurrently.
-    """
-    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
-    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
-    max_chunk_bytes = 200_000_000
-    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
-    quantadata = {
-        "frames": frames
-    }
-    chunks = {
-        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
-    }
-    compressors = {
-        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-    }
-    save_arrs_to_zarr(
-        quantadata, path,
-        chunks=chunks,
-        n_workers=n_workers,
-        overwrite=True,
-        attrs=attrs,
-        compressor_dict=compressors,
-    )
-
-
-def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
-    """
-    Cast quanta frames to uint8 and compute the metadata stored by the
-    ``write_quanta_*`` writers (see :func:`write_quanta_zarr`).
-
-    Returns:
-        tuple: ``(frames, attrs)``.
-    """
-    if T_exp is None:
-        if fps is not None:
-            T_exp = frames.shape[0] / fps
-        else:
-            raise ValueError("Either T_exp or fps must be provided")
-    elif fps is not None and T_exp is not None:
-        raise ValueError("Only one of T_exp or fps should be provided")
-    elif T_exp is not None and fps is None:
-        fps = frames.shape[0] / T_exp
-    frames = np.asarray(frames, dtype="uint8")
-    npoints = np.count_nonzero(frames)
-    npts_persec_perpix = np.count_nonzero(frames, axis=0) / T_exp
-    # statistics
-    avg_pts_persec_perpixel = npoints / (T_exp * frames.shape[1] * frames.shape[2])
-    max_pts_persec_perpixel = np.max(npts_persec_perpix)
-    min_pts_persec_perpixel = np.min(npts_persec_perpix)
-    med_pts_persec_perpixel = np.median(npts_persec_perpix)
-    stddev_pts_persec_perpixel = np.std(npts_persec_perpix, ddof=1)
-    fps = fps or (frames.shape[0] / T_exp)
-    attrs = {
-        "fps": fps,
-        "T_exp": T_exp,
-        "T": frames.shape[0],
-        "H": frames.shape[1],
-        "W": frames.shape[2],
-        "shape": "(T, H, W)",
-        "npoints": npoints,
-        "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
-        "max_pts_persec_perpixel": max_pts_persec_perpixel,
-        "min_pts_persec_perpixel": min_pts_persec_perpixel,
-        "med_pts_persec_perpixel": med_pts_persec_perpixel,
-        "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
-    }
-    return frames, attrs
-
-
-def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
-    """
-    Write binary quanta frames to an HDF5 file.
-
-    Same array and metadata as :func:`write_quanta_zarr`: a ``frames`` dataset at the
-    root of the file, with the metadata as root attributes.
-
-    Args:
-        path (str or Path): Path to the output HDF5 file.
-        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
-        T_exp (float): exposure time in seconds.
-        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
-    """
-    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
-    frames_per_chunk = _frames_per_chunk(
-        frames.shape[0], frames.shape[1] * frames.shape[2], HDF5_MAX_CHUNK_BYTES
-    )
-    _save_arrs_to_hdf5(
-        {"frames": frames}, path,
-        chunks={"frames": (frames_per_chunk, frames.shape[1], frames.shape[2])},
-        attrs=attrs,
-    )
-
-
-def write_quanta_gated_zarr(
-    path,
-    quanta_gated,
-    frames_per_chunk=None,
-    max_chunk_bytes=MAX_CHUNK_BYTES,
-    compressor=None,
-    attrs=None,
-    n_workers=8,
-    overwrite=True,
-):
-    """
-    Write a gated quanta acquisition to a single Zarr array (not a group) of shape
-    (n_frames, n_gate_steps, image_height, image_width), with the acquisition
-    metadata stored as array attributes.
-
-    Images are read and written chunk-by-chunk, so the full acquisition is never
-    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
-    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
-    summing over frames) touch whole chunks.
-
-    Args:
-        path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
-        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
-            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
-            acquisition metadata is attached.
-        frames_per_chunk (int or None): frames per chunk along the frame axis; if
-            None, the largest number that keeps a chunk under `max_chunk_bytes`.
-        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
-        compressor (codec or None): codec for compression (default: bitshuffle for
-            8-bit data, else shuffle).
-        attrs (dict or None): extra attributes, merged over the acquisition metadata.
-        n_workers (int): number of worker threads reading/writing chunks concurrently.
-        overwrite (bool): if True, overwrite an existing zarr at `path`.
-
-    Raises:
-        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
-            the image directory was passed instead).
-
-    Returns:
-        The written zarr array.
-    """
-    _check_quanta_gated(quanta_gated)
-    path = Path(path)
-    n_frames, n_gate_steps, height, width = quanta_gated.shape
-    if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
-    if compressor is None:
-        compressor = _default_compressor(quanta_gated.dtype)
-
-    def _create():
-        return zarr.create_array(
-            path,
-            shape=(n_frames, n_gate_steps, height, width),
-            dtype=quanta_gated.dtype,
-            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
-            compressors=compressor,
-            overwrite=overwrite,
-        )
-
-    try:
-        ds = _create()
-    except FileNotFoundError:
-        dot_clean_dir(path)
-        ds = _create()
-
-    for key, value in _quanta_gated_attrs(quanta_gated, attrs).items():
-        ds.attrs[key] = make_json_serializable(value)
-
-    tasks = [
-        (start, gate_idx)
-        for gate_idx in range(n_gate_steps)
-        for start in range(0, n_frames, frames_per_chunk)
-    ]
-
-    def write_chunk(task):
-        start, gate_idx = task
-        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
-        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
-
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
-    logger.info(f"Saved gated quanta to Zarr at: {path}")
-    return ds
-
-
-def _check_quanta_gated(quanta_gated):
-    """
-    Raise a TypeError unless `quanta_gated` is a :class:`QuantaGatedDir` (e.g. a path to
-    the image directory was passed instead).
-    """
-    if not isinstance(quanta_gated, QuantaGatedDir):
-        if isinstance(quanta_gated, (str, Path)):
-            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
-        else:
-            hint = "QuantaGatedDir(image_dir, ...)"
-        raise TypeError(
-            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
-            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
-            f"alongside the images."
-        )
-
-
-def _quanta_gated_attrs(quanta_gated, attrs=None):
-    """
-    Attributes stored by the ``write_quanta_gated_*`` writers: the acquisition metadata
-    plus `attrs` merged over it.
-    """
-    return {
-        **quanta_gated.metadata,
-        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
-        "source_dir": str(quanta_gated.path),
-        **(attrs or {}),
-    }
-
-
-def write_quanta_gated_hdf5(
-    path,
-    quanta_gated,
-    frames_per_chunk=None,
-    max_chunk_bytes=HDF5_MAX_CHUNK_BYTES,
-    attrs=None,
-    overwrite=True,
-):
-    """
-    Write a gated quanta acquisition to an HDF5 file, as a single ``frames`` dataset of
-    shape (n_frames, n_gate_steps, image_height, image_width) with the acquisition
-    metadata stored as attributes of that dataset (the same attributes
-    :func:`write_quanta_gated_zarr` stores on its array).
-
-    Images are read and written one chunk at a time, so the full acquisition is never
-    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), as in
-    :func:`write_quanta_gated_zarr`.
-
-    Args:
-        path (str or Path): path to the output HDF5 file (e.g. "gated.h5").
-        quanta_gated (QuantaGatedDir): the acquisition to write (the reader object, not
-            a path).
-        frames_per_chunk (int or None): frames per chunk along the frame axis; if
-            None, the largest number that keeps a chunk under `max_chunk_bytes`.
-        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
-        attrs (dict or None): extra attributes, merged over the acquisition metadata.
-        overwrite (bool): if True, overwrite an existing file at `path`.
-
-    Raises:
-        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir`.
-    """
-    _check_quanta_gated(quanta_gated)
-    n_frames, _, height, width = quanta_gated.shape
-    if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
-
-    with h5py.File(path, "w" if overwrite else "w-") as f:
-        ds = f.create_dataset(
-            "frames",
-            shape=quanta_gated.shape,
-            dtype=quanta_gated.dtype,
-            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
-            **HDF5_COMPRESSION,
-        )
-        _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
-        for frame_slice, gate_idx, block in quanta_gated.iter_chunks(frames_per_chunk):
-            ds[frame_slice, gate_idx] = block
-    logger.info(f"Saved gated quanta to HDF5 at: {path}")
-
-
-# ---------------------------------------------------------------------------
-# SPAD readers
-# ---------------------------------------------------------------------------
 def read_async_spad_dir(dirpath, h, w):
     """
     Reads a folder of .npy files containing per-pixel timestamp arrays.
@@ -802,32 +1171,6 @@ def read_async_spad_dir(dirpath, h, w):
     points = np.vstack(all_points)
     logger.info(f"Read {points.shape[0]} points from folder {dirpath}")
     return points, pixel_timeseries
-
-
-# Piccolo 32x32 sensor: photon arrival is a coarse counter tick minus a fine counter
-# tick, and the coarse counter is 16 bits wide, so it wraps every PICCOLO_ROLLOVER_S.
-PICCOLO_COARSE_TICK_S = 6.25e-9
-PICCOLO_FINE_TICK_S = 50e-12
-PICCOLO_ROLLOVER_S = 2**16 * PICCOLO_COARSE_TICK_S
-
-
-def _find_piccolo_timestamp_mats(dirpath):
-    """
-    Return ``(indices, paths)`` for every ``timestamps_{n}.mat`` in `dirpath`, sorted by
-    the integer n. The index is not zero-padded on disk, so a plain string sort would be
-    wrong (``timestamps_10.mat`` before ``timestamps_2.mat``).
-    """
-    dirpath = Path(dirpath)
-    pat = re.compile(r"^timestamps_(\d+)\.mat$")
-    found = {}
-    for f in dirpath.iterdir():
-        m = pat.match(f.name)
-        if m:
-            found[int(m.group(1))] = f
-    if not found:
-        raise FileNotFoundError(f"No timestamps_*.mat files found in {dirpath}")
-    idxs = sorted(found)  # numeric (natural) order
-    return idxs, [found[i] for i in idxs]
 
 
 def read_async_spad_piccolo_dir(
@@ -986,586 +1329,8 @@ def read_async_spad_hdf5(path, load_data=False, return_meta=False):
     return events, pixel_timeseries
 
 
-def _read_async_spad_arrays(root, load_data=False):
-    """
-    Read the ``(t, y, x)`` events and per-pixel timestamps from a Zarr group or h5py file
-    laid out by the ``write_async_spad_*`` writers.
-    """
-    # can't really lazily load this data
-    timestamps = root["t"][:]
-    offsets = root["offsets"][:]
-    lengths = root["lengths"][:]
-
-    H, W = offsets.shape
-    pixel_timeseries = [[None for _ in range(W)] for _ in range(H)]
-
-    for i in range(H):
-        for j in range(W):
-            start = offsets[i, j]
-            length = lengths[i, j]
-            pixel_timeseries[i][j] = timestamps[start: start + length]
-    # t is already in memory for the per-pixel slicing above
-    t = timestamps if load_data else root["t"]
-    y, x = root["y"], root["x"]
-    if load_data:
-        y = y[:]
-        x = x[:]
-    return (t, y, x), pixel_timeseries
-
-
-class LazyQuantaFrames:
-    """
-    Lazy ``(T, H, W)`` quanta frames backed by one or more ``.bin``/``.mat`` files,
-    concatenated along T in the given order. Returned by the ``.bin``/``.mat``/directory
-    quanta readers when ``load_data=False``.
-
-    Only file sizes/headers are read at construction. Frames are read from disk when
-    indexed, and only from the files the index touches. SPAD512 ``.bin`` and MATLAB v7.3
-    (HDF5) files are read partially; MATLAB v7/v7.2 files can only be loaded whole, so
-    each index that touches one loads that entire file.
-
-    Only integer and slice indexing (optionally with ``...``) is supported, with numpy
-    semantics; the result is a numpy array.
-
-    Args:
-        files: ``_QuantaBinFile``/``_QuantaMatFile`` objects, all with the same frame shape.
-    """
-
-    def __init__(self, files):
-        self._files = list(files)
-        frame_shapes = {f.shape[1:] for f in self._files}
-        if len(frame_shapes) != 1:
-            raise ValueError(f"Files have mismatched frame shapes: {sorted(frame_shapes)}")
-        # index of the first frame of each file within the concatenated frames
-        self._starts = [0, *accumulate(f.n_frames for f in self._files)]
-        self.shape = (self._starts[-1], *frame_shapes.pop())
-        self.dtype = np.result_type(*(f.dtype for f in self._files))
-
-    @property
-    def ndim(self):
-        return len(self.shape)
-
-    def __len__(self):
-        return self.shape[0]
-
-    def __repr__(self):
-        return f"{type(self).__name__}(n_files={len(self._files)}, shape={self.shape}, dtype={self.dtype})"
-
-    def __getitem__(self, key):
-        if not isinstance(key, tuple):
-            key = (key,)
-        for k in key:
-            if not (k is Ellipsis or isinstance(k, slice) or (isinstance(k, (int, np.integer)) and not isinstance(k, bool))):
-                raise TypeError(f"{type(self).__name__} only supports integer and slice indexing, got {k!r}")
-        n_ellipsis = sum(k is Ellipsis for k in key)
-        if n_ellipsis > 1:
-            raise IndexError("an index can only have a single ellipsis ('...')")
-        if n_ellipsis:
-            i = next(i for i, k in enumerate(key) if k is Ellipsis)
-            key = key[:i] + (slice(None),) * (self.ndim - len(key) + 1) + key[i + 1:]
-        if len(key) > self.ndim:
-            raise IndexError(f"too many indices for array: array is {self.ndim}-dimensional, but {len(key)} were indexed")
-        spatial_key = (slice(None), *key[1:])
-
-        t_idx = range(self.shape[0])[key[0]]  # int (IndexError if out of range) or range
-        is_int = not isinstance(t_idx, range)
-        t_range = range(t_idx, t_idx + 1) if is_int else t_idx
-        # read in increasing frame order, then flip back
-        reverse = t_range.step < 0
-        if reverse:
-            t_range = t_range[::-1]
-
-        pieces = []
-        for f, start in zip(self._files, self._starts):
-            # the elements of t_range that fall within this file
-            lo = max(0, -(-(start - t_range.start) // t_range.step))
-            hi = max(0, -(-(start + f.n_frames - t_range.start) // t_range.step))
-            sub = t_range[lo:hi]
-            if sub:
-                sel = slice(sub[0] - start, sub[-1] - start + 1, sub.step)
-                pieces.append(f.read(sel)[spatial_key])
-
-        if not pieces:
-            frames = np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key]
-        elif len(pieces) == 1:
-            frames = pieces[0]
-        else:
-            frames = np.concatenate(pieces, axis=0)
-        if reverse:
-            frames = frames[::-1]
-        if not is_int:
-            return frames
-        # like numpy, an all-integer index with an ellipsis gives a 0-d array, not a scalar
-        return frames[0, ...] if n_ellipsis else frames[0]
-
-
-class _QuantaBinFile:
-    """
-    A single SPAD512 packed-bits ``.bin`` file, read as ``(T, W, H)`` frames on demand.
-
-    Ripped from spadtools (https://github.com/lyehe/spadtools).
-    """
-
-    def __init__(self, path, H=512, W=512):
-        self.path = Path(path)
-        self.H = 512 if H is None else H
-        self.W = 512 if W is None else W
-        self._frame_nbytes = self.H * self.W // 8
-        nbytes = self.path.stat().st_size
-        if nbytes % self._frame_nbytes:
-            raise ValueError(
-                f"{self.path.name}: file size ({nbytes} bytes) is not a multiple of the "
-                f"frame size ({self._frame_nbytes} bytes for H={self.H}, W={self.W})"
-            )
-        self.n_frames = nbytes // self._frame_nbytes
-        self.shape = (self.n_frames, self.W, self.H)  # rot90 on read swaps H and W
-        self.dtype = np.dtype(np.uint8)
-
-    def read(self, sel=slice(None)):
-        """Read the frames selected by `sel` (a slice with positive step)."""
-        start, stop, step = sel.indices(self.n_frames)
-        with open(self.path, "rb") as f:
-            f.seek(start * self._frame_nbytes)
-            raw_data = f.read(max(stop - start, 0) * self._frame_nbytes)
-        bits_array = np.frombuffer(raw_data, dtype=np.uint8).reshape(-1, self.H, self.W // 8)[::step]
-        frames = np.unpackbits(bits_array, axis=2)
-        return np.rot90(frames, k=1, axes=(1, 2))
-
-
-class _QuantaMatFile:
-    """
-    A single MATLAB ``.mat`` quanta volume stored as ``(H, W, T)``, read as ``(T, H, W)``
-    frames on demand. Only the variable's shape and dtype are read at construction.
-    """
-
-    def __init__(self, path, key=None):
-        self.path = Path(path)
-        self.key, shape, dtype, self._is_hdf5 = _inspect_mat_array(self.path, key=key)
-        if len(shape) != 3:
-            raise ValueError(f"{self.path.name}: expected 3D array, got shape {shape}")
-        self.n_frames = shape[2]
-        self.shape = (shape[2], shape[0], shape[1])
-        self.dtype = np.dtype(dtype)
-
-    def read(self, sel=slice(None)):
-        """Read the frames selected by `sel` (a slice with positive step)."""
-        if self._is_hdf5:
-            import h5py
-            with h5py.File(self.path.as_posix(), "r") as f:
-                arr = f[self.key][:, :, sel]  # only reads the selected frames
-        else:
-            import scipy.io
-            arr = scipy.io.loadmat(self.path.as_posix(), variable_names=[self.key])[self.key][:, :, sel]
-        # (H, W, T) -> (T, H, W)
-        return np.transpose(arr, (2, 0, 1))
-
-
-def read_quanta_bin(path, H=512, W=512, load_data=False):
-    """
-    Read a single binary SPAD512 file.
-
-    Args:
-        load_data (bool): if True, read the whole file into memory as a numpy array. If
-            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
-
-    Ripped from spadtools (https://github.com/lyehe/spadtools).
-    """
-    frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
-    return frames[:] if load_data else frames
-
-
-def _inspect_mat_array(mat_path, key=None):
-    """
-    Find the array to read from a MATLAB ``.mat`` file and get its stored shape and
-    dtype, without loading its data.
-
-    Supports both MATLAB v7/v7.2 files (via ``scipy.io.whosmat``) and v7.3 HDF5-based
-    files (via ``h5py``, imported lazily so it is only required for v7.3 data).
-
-    Args:
-        mat_path (str or Path): Path to the .mat file.
-        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
-            array. If None, expects exactly one 3D array (v7.3) or one non-reserved
-            variable (v7/v7.2) in the file.
-
-    Returns:
-        tuple: (key, shape, dtype, is_hdf5)
-    """
-    mat_path = Path(mat_path)
-
-    # Try scipy first (handles v7/v7.2; raises NotImplementedError for v7.3 files).
-    scipy_error = None
-    try:
-        import scipy.io
-        variables = {name: (shape, cls) for name, shape, cls in scipy.io.whosmat(mat_path.as_posix())}
-        candidates = list(variables)
-        if not candidates:
-            raise ValueError(f"No array variables found in {mat_path.name}")
-        if key is None:
-            if len(candidates) != 1:
-                raise ValueError(
-                    f"{mat_path.name}: multiple variables found {candidates}. "
-                    f"Specify one with key=."
-                )
-            key_use = candidates[0]
-        else:
-            if key not in variables:
-                raise KeyError(f"{mat_path.name}: key '{key}' not found. Available: {candidates}")
-            key_use = key
-        shape, cls = variables[key_use]
-        # MATLAB class names match numpy dtype names, except logical (loaded as uint8)
-        return key_use, shape, np.dtype(np.uint8 if cls == "logical" else cls), False
-    except NotImplementedError:
-        pass  # v7.3 file; fall through to h5py
-    except Exception as e:
-        scipy_error = e
-
-    # Try h5py (v7.3 / HDF5-backed .mat).
-    try:
-        import h5py
-        with h5py.File(mat_path.as_posix(), "r") as f:
-            if key is None:
-                datasets = []
-
-                def _visit(name, obj):
-                    if hasattr(obj, "shape") and hasattr(obj, "dtype") and len(getattr(obj, "shape", ())) == 3:
-                        datasets.append(name)
-
-                f.visititems(_visit)
-                if not datasets:
-                    raise ValueError(f"{mat_path.name}: no 3D datasets found (v7.3).")
-                if len(datasets) != 1:
-                    raise ValueError(
-                        f"{mat_path.name}: multiple 3D datasets found {datasets}. "
-                        f"Specify one with key= (use full path inside the .mat)."
-                    )
-                key_use = datasets[0]
-            else:
-                key_use = key
-                if key_use not in f:
-                    raise KeyError(f"{mat_path.name}: dataset '{key_use}' not found in v7.3 file.")
-            ds = f[key_use]
-            return key_use, ds.shape, ds.dtype, True
-    except Exception as e:
-        if scipy_error is not None:
-            raise RuntimeError(
-                f"Failed to load {mat_path.name} with scipy ({scipy_error}) and h5py ({e})."
-            ) from e
-        raise
-
-
-def read_quanta_mat(path, key=None, load_data=False):
-    """
-    Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
-    (consistent with :func:`read_quanta_bin`).
-
-    The volume is assumed to be stored as ``(H, W, T)`` (MATLAB WxHxT convention) and is
-    transposed to ``(T, H, W)`` on read. Dtype is preserved from the file.
-
-    Args:
-        path (str or Path): Path to the .mat file.
-        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
-            volume. If None, expects exactly one 3D array in the file.
-        load_data (bool): if True, read the whole volume into memory as a numpy array. If
-            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
-    """
-    frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
-    return frames[:] if load_data else frames
-
-
-def _ignore_dotfiles(paths):
-    """
-    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
-    listing, warning about any that were found.
-    """
-    kept, dotfiles = [], []
-    for p in paths:
-        (dotfiles if p.name.startswith(".") else kept).append(p)
-    if dotfiles:
-        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
-        # dot_clean only exists on macOS, so only suggest it there
-        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
-        logger.warning(
-            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
-            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
-        )
-    return kept
-
-
-def _read_mat_meta(path):
-    """
-    Read the optional MATLAB-volume metadata sidecar from a directory.
-
-    Looks for ``info.json`` first, then falls back to any single ``*.json`` file. The
-    JSON is expected to carry ``no_frames_total``, ``no_parts`` and ``no_frames`` keys
-    (as produced by the concat-to-zarr tooling) but any/all may be absent.
-
-    Returns:
-        dict or None: parsed metadata, or None if no readable sidecar is found.
-    """
-    path = Path(path)
-    meta_path = path / "info.json"
-    if not meta_path.is_file():
-        candidates = sorted(_ignore_dotfiles(path.glob("*.json")))
-        if not candidates:
-            return None
-        meta_path = candidates[0]
-    try:
-        return json.loads(meta_path.read_text())
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning(f"Could not parse metadata file {meta_path.name}: {e}")
-        return None
-
-
-def _read_quanta_mat_dir(path, matpaths, key=None, load_data=False):
-    """
-    Read and concatenate a directory of MATLAB ``.mat`` quanta volumes into ``(T, H, W)``.
-
-    Files are read in the caller-provided (natural sorted) order and concatenated along
-    T. If an ``info.json`` sidecar is present, its ``no_parts``/``no_frames_total`` are
-    used to validate the result (mismatches are logged as warnings, not fatal).
-    """
-    meta = _read_mat_meta(path)
-    no_parts = meta.get("no_parts") if meta else None
-    if no_parts is not None and len(matpaths) != int(no_parts):
-        logger.warning(f"Metadata says no_parts={no_parts}, but found {len(matpaths)} .mat files.")
-
-    files = [_QuantaMatFile(f, key=key) for f in matpaths]
-    frames = LazyQuantaFrames(files)
-
-    no_frames_total = meta.get("no_frames_total") if meta else None
-    if no_frames_total is not None and frames.shape[0] != int(no_frames_total):
-        logger.warning(
-            f"Metadata says no_frames_total={no_frames_total}, but found {frames.shape[0]} frames."
-        )
-    if not load_data:
-        return frames
-    return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
-
-
-def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
-    """
-    Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
-    array.
-
-    Two directory layouts are supported (detected automatically):
-
-    - **SPAD512 binary**: ``*.bin`` files; frame dimensions are given by ``H``, ``W``,
-      read in natural sorted order.
-    - **MATLAB volumes**: ``*.mat`` files, each a ``(H, W, T)`` volume, read in natural
-      sorted order (e.g. ``part2.mat`` before ``part10.mat``) and concatenated along T.
-      An optional ``info.json`` sidecar (with ``no_frames_total``, ``no_parts``,
-      ``no_frames``) is used to validate the result if present.
-
-    Args:
-        H, W (int): Height and width of the frames where it cannot be inferred (e.g.
-            SPAD512 .bin files). Ignored for .mat files, where they are inferred.
-        key (str or None): For .mat files, the variable/dataset name holding the volume.
-            If None, expects exactly one 3D array per file.
-        load_data (bool): if True, read all files into memory as a numpy array. If False
-            (default), return a :class:`LazyQuantaFrames` over all files that reads frames when
-            indexed.
-    """
-    path = Path(path)
-    if not path.is_dir():
-        raise FileNotFoundError(f"Path {path} is not a directory")
-
-    binpaths = sorted(_ignore_dotfiles(path.glob("*.bin")), key=lambda p: natural_sort_key(p.name))
-    if binpaths:
-        try:
-            files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
-            frames = LazyQuantaFrames(files)
-        except ValueError as e:
-            logger.error(f"Error reading the .bin files in {path}, likely due to a truncated or non-SPAD512 file in the directory.")
-            raise e
-        if not load_data:
-            return frames
-        return np.concatenate([f.read() for f in tqdm(files, desc="Reading .bin files from directory")], axis=0)
-
-    matpaths = sorted(_ignore_dotfiles(path.glob("*.mat")), key=lambda p: natural_sort_key(p.name))
-    if matpaths:
-        return _read_quanta_mat_dir(path, matpaths, key=key, load_data=load_data)
-
-    raise FileNotFoundError(f"No *.bin or *.mat files found in {path}")
-
-
-def read_quanta_zarr(path, load_data=False, return_meta=False):
-    """
-    Read quanta frames from a Zarr v3 group.
-
-    Works with:
-      - "original" QuantaBurst zarr (frames/quantaframes + rich attrs)
-      - your concatenated zarr (data + different attrs)
-
-    Args:
-        path (str or Path): path to the Zarr group.
-        load_data (bool): if True, read the frames into memory as a numpy array. If
-            False (default), return the lazy zarr array.
-        return_meta (bool): if True, also return the group attributes.
-
-    Returns:
-        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
-        return_meta=True.
-    """
-    zarrdata = zarr.open_group(str(path), mode="r")
-
-    # Zarr v3 safe listing of arrays
-    keys = set(zarrdata.array_keys())
-
-    # Accept multiple possible dataset names
-    candidate_keys = ("frames", "quantaframes", "data")
-    framekey = next((k for k in candidate_keys if k in keys), None)
-    if framekey is None:
-        raise KeyError(
-            f"No frames array found in {path}. "
-            f"Available arrays: {sorted(keys)}"
-        )
-
-    frames = zarrdata[framekey]
-    if load_data:
-        frames = frames[:]
-
-    # attrs differ between the two formats; just return them as-is
-    return (frames, dict(zarrdata.attrs)) if return_meta else frames
-
-
-def read_quanta_hdf5(path, load_data=False, return_meta=False):
-    """
-    Read quanta frames from an HDF5 file written by :func:`write_quanta_hdf5`.
-
-    Args:
-        path (str or Path): path to the HDF5 file.
-        load_data (bool): if True, read the frames into memory as a numpy array. If
-            False (default), return the lazy h5py dataset, which keeps the file open
-            (read-only) for as long as it is referenced.
-        return_meta (bool): if True, also return the root attributes.
-
-    Returns:
-        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
-        return_meta=True.
-    """
-    frames = _open_hdf5_frames(path)
-    attrs = _get_hdf5_attrs(frames.file)
-    if load_data:
-        f = frames.file
-        frames = frames[:]
-        f.close()
-    return (frames, attrs) if return_meta else frames
-
-
-def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
-    """
-    Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
-    array (not a group).
-
-    A gated acquisition is typically far too large to hold in memory (the reason it is
-    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place), so
-    the lazy zarr array is returned by default and sliced by the caller.
-
-    Args:
-        path (str or Path): path to the Zarr array.
-        load_data (bool): if True, read the whole acquisition into memory as a numpy
-            array. If False (default), return the lazy zarr array.
-        return_meta (bool): if True, also return the array attributes (acquisition
-            metadata).
-
-    Returns:
-        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
-        load_data=True; or ``(frames, metadata)`` if return_meta=True.
-    """
-    try:
-        ds = zarr.open_array(path, mode="r")
-    except zarr.errors.NodeTypeValidationError as e:
-        raise ValueError(
-            f"{path} is a Zarr group, not a Zarr array; gated quanta are written as a "
-            f"single array by write_quanta_gated_zarr. Use read_quanta_zarr for group-based "
-            f"quanta data."
-        ) from e
-    if ds.ndim != 4:
-        raise ValueError(
-            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
-            f"array, got shape {ds.shape}"
-        )
-    frames = ds[:] if load_data else ds
-    return (frames, dict(ds.attrs)) if return_meta else frames
-
-
-def read_quanta_gated_hdf5(path, load_data=False, return_meta=False):
-    """
-    Read gated quanta frames written by :func:`write_quanta_gated_hdf5` from the
-    ``frames`` dataset of an HDF5 file.
-
-    As with :func:`read_quanta_gated_zarr`, the lazy dataset is returned by default and
-    sliced by the caller.
-
-    Args:
-        path (str or Path): path to the HDF5 file.
-        load_data (bool): if True, read the whole acquisition into memory as a numpy
-            array. If False (default), return the lazy h5py dataset, which keeps the
-            file open (read-only) for as long as it is referenced.
-        return_meta (bool): if True, also return the dataset attributes (acquisition
-            metadata).
-
-    Returns:
-        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
-        load_data=True; or ``(frames, metadata)`` if return_meta=True.
-    """
-    ds = _open_hdf5_frames(path)
-    if ds.ndim != 4:
-        shape = ds.shape
-        ds.file.close()
-        raise ValueError(
-            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
-            f"frames dataset, got shape {shape}"
-        )
-    attrs = _get_hdf5_attrs(ds)
-    frames = ds
-    if load_data:
-        frames = ds[:]
-        ds.file.close()
-    return (frames, attrs) if return_meta else frames
-
-
-def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
-    """
-    Automatically detects the format of the input path and reads the quanta data accordingly:
-    a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
-
-    Args:
-        load_data (bool): If True, load the data into memory. If False (default), returns
-            lazy data if supported.
-        return_meta (bool): If True, also return the metadata (None for formats that
-            carry none).
-        H, W (int): Height and width of the frames where it cannot be inferred (e.g. SPAD512 .bin files).
-            Otherwise, these are ignored and inferred from data.
-        key (str or None): For .mat inputs, the variable/dataset name holding the volume.
-            If None, expects exactly one 3D array per file.
-
-    Returns:
-        quantaframes: array of shape (T, H, W) with binary frames, lazy unless
-        load_data=True; or ``(quantaframes, metadata)`` if return_meta=True, where
-        metadata is a dict of the relevant metadata if available, else None.
-    """
-    path = Path(path)
-    if path.suffix == ".zarr":
-        logger.info(f"Reading quanta from Zarr file: {path}")
-        frames, metadata = read_quanta_zarr(path, load_data=load_data, return_meta=True)
-        return (frames, metadata) if return_meta else frames
-    elif path.suffix == ".bin":
-        logger.info(f"Reading quanta from binary file: {path}")
-        frames = read_quanta_bin(path, H=H, W=W, load_data=load_data)
-    elif path.suffix == ".mat":
-        logger.info(f"Reading quanta from MATLAB file: {path}")
-        frames = read_quanta_mat(path, key=key, load_data=load_data)
-    else:
-        # otherwise, assume it's a directory of .bin or .mat files
-        logger.info(f"Reading quanta from directory of quanta files: {path}")
-        frames = read_quanta_dir(path, H=H, W=W, key=key, load_data=load_data)
-    return (frames, None) if return_meta else frames
-
-
 # ---------------------------------------------------------------------------
-# Gated quanta (SPAD512 PNG sequences)
+# Gated quanta data: (n_frames, n_gate_steps, H, W) SPAD512 PNG sequences
 # ---------------------------------------------------------------------------
 class QuantaGatedDir:
     """
@@ -1784,6 +1549,244 @@ class QuantaGatedDir:
             stop = min(start + frames_per_chunk, self.n_frames)
             frame_slice = slice(start, stop)
             yield frame_slice, gate_idx, self.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+
+
+def _check_quanta_gated(quanta_gated):
+    """
+    Raise a TypeError unless `quanta_gated` is a :class:`QuantaGatedDir` (e.g. a path to
+    the image directory was passed instead).
+    """
+    if not isinstance(quanta_gated, QuantaGatedDir):
+        if isinstance(quanta_gated, (str, Path)):
+            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
+        else:
+            hint = "QuantaGatedDir(image_dir, ...)"
+        raise TypeError(
+            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
+            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
+            f"alongside the images."
+        )
+
+
+def _quanta_gated_attrs(quanta_gated, attrs=None):
+    """
+    Attributes stored by the ``write_quanta_gated_*`` writers: the acquisition metadata
+    plus `attrs` merged over it.
+    """
+    return {
+        **quanta_gated.metadata,
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+        "source_dir": str(quanta_gated.path),
+        **(attrs or {}),
+    }
+
+
+def write_quanta_gated_zarr(
+    path,
+    quanta_gated,
+    frames_per_chunk=None,
+    max_chunk_bytes=MAX_CHUNK_BYTES,
+    compressor=None,
+    attrs=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to a single Zarr array (not a group) of shape
+    (n_frames, n_gate_steps, image_height, image_width), with the acquisition
+    metadata stored as array attributes.
+
+    Images are read and written chunk-by-chunk, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
+    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
+    summing over frames) touch whole chunks.
+
+    Args:
+        path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
+        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
+            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
+            acquisition metadata is attached.
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        compressor (codec or None): codec for compression (default: bitshuffle for
+            8-bit data, else shuffle).
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        n_workers (int): number of worker threads reading/writing chunks concurrently.
+        overwrite (bool): if True, overwrite an existing zarr at `path`.
+
+    Raises:
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
+            the image directory was passed instead).
+
+    Returns:
+        The written zarr array.
+    """
+    _check_quanta_gated(quanta_gated)
+    path = Path(path)
+    n_frames, n_gate_steps, height, width = quanta_gated.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+    if compressor is None:
+        compressor = _default_compressor(quanta_gated.dtype)
+
+    def _create():
+        return zarr.create_array(
+            path,
+            shape=(n_frames, n_gate_steps, height, width),
+            dtype=quanta_gated.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            compressors=compressor,
+            overwrite=overwrite,
+        )
+
+    try:
+        ds = _create()
+    except FileNotFoundError:
+        dot_clean_dir(path)
+        ds = _create()
+
+    for key, value in _quanta_gated_attrs(quanta_gated, attrs).items():
+        ds.attrs[key] = make_json_serializable(value)
+
+    tasks = [
+        (start, gate_idx)
+        for gate_idx in range(n_gate_steps)
+        for start in range(0, n_frames, frames_per_chunk)
+    ]
+
+    def write_chunk(task):
+        start, gate_idx = task
+        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
+        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
+    logger.info(f"Saved gated quanta to Zarr at: {path}")
+    return ds
+
+
+def write_quanta_gated_hdf5(
+    path,
+    quanta_gated,
+    frames_per_chunk=None,
+    max_chunk_bytes=HDF5_MAX_CHUNK_BYTES,
+    attrs=None,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to an HDF5 file, as a single ``frames`` dataset of
+    shape (n_frames, n_gate_steps, image_height, image_width) with the acquisition
+    metadata stored as attributes of that dataset (the same attributes
+    :func:`write_quanta_gated_zarr` stores on its array).
+
+    Images are read and written one chunk at a time, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), as in
+    :func:`write_quanta_gated_zarr`.
+
+    Args:
+        path (str or Path): path to the output HDF5 file (e.g. "gated.h5").
+        quanta_gated (QuantaGatedDir): the acquisition to write (the reader object, not
+            a path).
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+
+    Raises:
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir`.
+    """
+    _check_quanta_gated(quanta_gated)
+    n_frames, _, height, width = quanta_gated.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+
+    with h5py.File(path, "w" if overwrite else "w-") as f:
+        ds = f.create_dataset(
+            "frames",
+            shape=quanta_gated.shape,
+            dtype=quanta_gated.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            **HDF5_COMPRESSION,
+        )
+        _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
+        for frame_slice, gate_idx, block in quanta_gated.iter_chunks(frames_per_chunk):
+            ds[frame_slice, gate_idx] = block
+    logger.info(f"Saved gated quanta to HDF5 at: {path}")
+
+
+def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
+    array (not a group).
+
+    A gated acquisition is typically far too large to hold in memory (the reason it is
+    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place), so
+    the lazy zarr array is returned by default and sliced by the caller.
+
+    Args:
+        path (str or Path): path to the Zarr array.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy zarr array.
+        return_meta (bool): if True, also return the array attributes (acquisition
+            metadata).
+
+    Returns:
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+    """
+    try:
+        ds = zarr.open_array(path, mode="r")
+    except zarr.errors.NodeTypeValidationError as e:
+        raise ValueError(
+            f"{path} is a Zarr group, not a Zarr array; gated quanta are written as a "
+            f"single array by write_quanta_gated_zarr. Use read_quanta_zarr for group-based "
+            f"quanta data."
+        ) from e
+    if ds.ndim != 4:
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"array, got shape {ds.shape}"
+        )
+    frames = ds[:] if load_data else ds
+    return (frames, dict(ds.attrs)) if return_meta else frames
+
+
+def read_quanta_gated_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_hdf5` from the
+    ``frames`` dataset of an HDF5 file.
+
+    As with :func:`read_quanta_gated_zarr`, the lazy dataset is returned by default and
+    sliced by the caller.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy h5py dataset, which keeps the
+            file open (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the dataset attributes (acquisition
+            metadata).
+
+    Returns:
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+    """
+    ds = _open_hdf5_frames(path)
+    if ds.ndim != 4:
+        shape = ds.shape
+        ds.file.close()
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"frames dataset, got shape {shape}"
+        )
+    attrs = _get_hdf5_attrs(ds)
+    frames = ds
+    if load_data:
+        frames = ds[:]
+        ds.file.close()
+    return (frames, attrs) if return_meta else frames
 
 
 # ---------------------------------------------------------------------------
