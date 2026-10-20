@@ -112,10 +112,9 @@ def test_dotfile_warning_only_suggests_dot_clean_on_macos(bin_dir, monkeypatch, 
     ("bin_path", read_quanta_auto),
     ("bin_dir", read_quanta_auto),
 ])
-def test_bin_unspecified_size_warns_and_defaults_to_512(request, frames, caplog, fixture, reader):
-    with caplog.at_level(logging.WARNING):
+def test_bin_unspecified_size_warns_and_defaults_to_512(request, frames, fixture, reader):
+    with pytest.warns(UserWarning, match="frame size of .bin data not specified"):
         _check(reader(request.getfixturevalue(fixture), load_data=True), frames)
-    assert "frame size of .bin data not specified" in caplog.text
 
 
 @pytest.mark.parametrize("fixture, reader", [
@@ -123,10 +122,15 @@ def test_bin_unspecified_size_warns_and_defaults_to_512(request, frames, caplog,
     ("bin_dir", lambda p: read_quanta_dir(p, H=H, W=W)),
     ("mat_dir", read_quanta_dir),  # H/W don't apply to .mat files
 ])
-def test_bin_size_warning_only_when_needed(request, caplog, fixture, reader):
-    with caplog.at_level(logging.WARNING):
-        reader(request.getfixturevalue(fixture))
-    assert "frame size of .bin data not specified" not in caplog.text
+def test_bin_size_warning_only_when_needed(request, recwarn, fixture, reader):
+    reader(request.getfixturevalue(fixture))
+    assert not any("frame size of .bin data not specified" in str(w.message) for w in recwarn)
+
+
+def test_bin_size_warning_points_at_caller(bin_path):
+    with pytest.warns(UserWarning) as record:
+        read_quanta_bin(bin_path)
+    assert record[0].filename == __file__
 
 
 # --- auto-detection dispatch ----------------------------------------------

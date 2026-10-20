@@ -733,10 +733,11 @@ def _bin_frame_shape(path, H, W):
     (None) dimension defaults to 512, with a warning.
     """
     if H is None or W is None:
-        logger.warning(
+        warnings.warn(
             f"{Path(path).name}: frame size of .bin data not specified (H={H}, W={W}); "
             f"assuming 512 for the missing dimension(s). Pass H and W explicitly to "
-            f"silence this warning."
+            f"silence this warning.",
+            stacklevel=3,  # point at the caller of read_quanta_bin/read_quanta_dir
         )
     return (512 if H is None else H), (512 if W is None else W)
 
