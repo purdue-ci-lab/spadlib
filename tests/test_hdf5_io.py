@@ -13,6 +13,7 @@ from spadlib.io import (
     QuantaGatedDir,
     read_async_spad_hdf5,
     read_async_spad_zarr,
+    read_quanta_auto,
     read_quanta_gated_hdf5,
     read_quanta_hdf5,
     read_quanta_zarr,
@@ -146,6 +147,16 @@ def test_quanta_hdf5_lazy_and_chunked(tmp_path, frames):
     _check_compression(read_frames)
     chunk_nbytes = np.prod(read_frames.chunks) * read_frames.dtype.itemsize
     assert chunk_nbytes <= HDF5_MAX_CHUNK_BYTES
+
+
+@pytest.mark.parametrize("suffix", [".h5", ".hdf5"])
+def test_read_quanta_auto_hdf5(tmp_path, frames, suffix):
+    path = tmp_path / f"data{suffix}"
+    write_quanta_hdf5(path, frames, T_exp=1.0)
+    read_frames, meta = read_quanta_auto(path, load_data=True, return_meta=True)
+    np.testing.assert_array_equal(read_frames, frames)
+    assert meta == read_quanta_hdf5(path, return_meta=True)[1]
+    assert isinstance(read_quanta_auto(path), h5py.Dataset)
 
 
 def test_quanta_hdf5_missing_frames_raises(tmp_path):

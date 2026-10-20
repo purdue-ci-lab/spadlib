@@ -873,7 +873,8 @@ def read_quanta_hdf5(path, load_data=False, return_meta=False):
 def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
     """
     Automatically detects the format of the input path and reads the quanta data accordingly:
-    a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
+    a .zarr group, a .h5/.hdf5 file, a .bin file, a .mat file, or a directory of .bin/.mat
+    files.
 
     Args:
         load_data (bool): If True, load the data into memory. If False (default), returns
@@ -894,6 +895,10 @@ def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, k
     if path.suffix == ".zarr":
         logger.info(f"Reading quanta from Zarr file: {path}")
         frames, metadata = read_quanta_zarr(path, load_data=load_data, return_meta=True)
+        return (frames, metadata) if return_meta else frames
+    elif path.suffix in (".h5", ".hdf5"):
+        logger.info(f"Reading quanta from HDF5 file: {path}")
+        frames, metadata = read_quanta_hdf5(path, load_data=load_data, return_meta=True)
         return (frames, metadata) if return_meta else frames
     elif path.suffix == ".bin":
         logger.info(f"Reading quanta from binary file: {path}")
