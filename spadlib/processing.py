@@ -1,8 +1,9 @@
 """
 Data-modifying processing operations for SPAD/quanta data: photon thinning,
-dark-count-rate (DCR) injection, and hot/dead pixel correction.
+dark-count-rate (DCR) injection, frame accumulation, and hot/dead pixel correction.
 """
 import logging
+import warnings
 
 import cv2
 import dask.array as da
@@ -156,6 +157,53 @@ def thin_frames_counts_dask(frames, keep_prob, dcr_rate=None, seed=None):
     out = thinned.compute()
     del thinned
     del frames
+    return out
+
+
+def accumulate_frames(frames, n, dtype=None, t_chunk=1000):
+    """
+    Sum every `n` consecutive frames of a (T, H, W) stack into one, giving
+    (T // n, H, W) photon-count frames. Leftover frames at the end that don't fill a
+    whole group of `n` are dropped, with a warning.
+
+    `frames` may be a numpy array or any lazy array that supports slicing along T
+    (e.g. :class:`spadlib.io.LazyQuantaFrames`, zarr or h5py arrays); it is read
+    `t_chunk` frames (rounded down to whole groups) at a time.
+
+    Args:
+        frames: array of shape (T, H, W).
+        n (int): number of frames summed into each output frame.
+        dtype: dtype of the output. If None, the smallest dtype that cannot overflow
+            when summing `n` values of the input dtype (e.g. uint8 binary frames with
+            n=100 give uint16); float inputs keep their dtype.
+        t_chunk (int): approximate number of input frames read per chunk.
+    """
+    T = frames.shape[0]
+    n_out = T // n
+    if n_out == 0:
+        raise ValueError(f"n={n} is larger than the number of frames ({T}).")
+    if T % n:
+        warnings.warn(
+            f"{T} frames is not a multiple of n={n}; dropping the last {T % n} frame(s).",
+            stacklevel=2,
+        )
+    if dtype is None:
+        in_dtype = np.dtype(frames.dtype)
+        if in_dtype == bool:
+            dtype = np.min_scalar_type(n)
+        elif in_dtype.kind == "u":
+            dtype = np.min_scalar_type(n * int(np.iinfo(in_dtype).max))
+        elif in_dtype.kind == "i":
+            dtype = np.min_scalar_type(n * int(np.iinfo(in_dtype).min))
+        else:
+            dtype = in_dtype
+
+    out = np.empty((n_out, *frames.shape[1:]), dtype=dtype)
+    groups_per_chunk = max(1, t_chunk // n)
+    for g0 in tqdm(range(0, n_out, groups_per_chunk), desc="Accumulating frames"):
+        g1 = min(n_out, g0 + groups_per_chunk)
+        block = np.asarray(frames[g0 * n:g1 * n])
+        out[g0:g1] = block.reshape(g1 - g0, n, *block.shape[1:]).sum(axis=1, dtype=dtype)
     return out
 
 

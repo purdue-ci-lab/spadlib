@@ -1,6 +1,6 @@
 """
-Miscellaneous utility helpers: temporary memmaps, JSON serialization, natural
-sorting, number formatting, and colormap conversions.
+Miscellaneous utility helpers: temporary memmaps, macOS dotfile cleanup, JSON
+serialization, natural sorting, number formatting, and colormap conversions.
 """
 import atexit
 import json
@@ -39,6 +39,25 @@ def dot_clean_dir(path):
         capture_output=True, text=True, check=True
     )
     return result
+
+
+def _ignore_dotfiles(paths):
+    """
+    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
+    listing, warning about any that were found.
+    """
+    kept, dotfiles = [], []
+    for p in paths:
+        (dotfiles if p.name.startswith(".") else kept).append(p)
+    if dotfiles:
+        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
+        # dot_clean only exists on macOS, so only suggest it there
+        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
+        logger.warning(
+            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
+            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
+        )
+    return kept
 
 
 def is_json_serializable(x):

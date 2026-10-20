@@ -17,24 +17,32 @@ The representation names above (``frames``/``events``/``pixel_timeseries``) are 
 only by the format-conversion functions at the bottom of this module. Pre-convention
 names are kept as aliases at the end of the file.
 
-Also includes generic array <-> Zarr helpers used by the SPAD writers.
+Also includes generic array <-> Zarr helpers used by the SPAD writers. The HDF5 (h5py)
+readers/writers store the same arrays and metadata as their Zarr counterparts, GZIP
+compressed with the shuffle filter, and read/write single-threaded.
 """
 import json
 import logging
 import re
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from itertools import accumulate, product
 from pathlib import Path
 import warnings
 
 import cv2
+import h5py
 import numpy as np
 import zarr
 from tqdm import tqdm
 
 from spadlib.processing import correct_hotpixels_conv, thin_events_uniform, thin_frames_uniform
-from spadlib.utils import dot_clean_dir, is_json_serializable, make_json_serializable, natural_sort_key
+from spadlib.utils import (
+    _ignore_dotfiles,
+    dot_clean_dir,
+    is_json_serializable,
+    make_json_serializable,
+    natural_sort_key,
+)
 
 try:
     import cupy as cp
@@ -225,140 +233,108 @@ def save_arr_to_zarr(
 
 
 # ---------------------------------------------------------------------------
-# SPAD writers
+# Generic array <-> HDF5 helpers
 # ---------------------------------------------------------------------------
-def write_async_spad_npys(pixel_timeseries, output_dir):
+# HDF5 decompresses a whole chunk on any partial read and by default caches only
+# 1 MiB of chunks per dataset, so chunks are kept around that size; bigger chunks would
+# be decompressed again on every small (e.g. frame-by-frame) read.
+HDF5_MAX_CHUNK_BYTES = 1_048_576
+HDF5_COMPRESSION = {"compression": "gzip", "shuffle": True}
+
+
+def _set_hdf5_attrs(obj, attrs):
     """
-    Save a list of lists of pixel timeseries to .npy files, where pixel_timeseries[y][x] is an array of timestamps for that pixel.
-    The files will be named with the pattern "scan_posX{X}_posY{Y}.npy" where {X} and {Y} are the pixel coordinates.
-
-    This is the write counterpart to :func:`read_async_spad_dir`.
-
-    Originally pixel_timeseries_to_npys(pixel_timeseries, output_dir), then
-    write_pixel_timeseries_npys(pixel_timeseries, output_dir).
+    Set `attrs` on an h5py file/group/dataset. Values are made JSON-serializable first,
+    like the Zarr writers do; None is stored as an empty attribute, and values HDF5 has
+    no native type for (e.g. dicts, mixed-type lists) as JSON strings.
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pbar = tqdm(total=len(pixel_timeseries) * len(pixel_timeseries[0]), desc="Saving pixel timeseries to .npy files")
-    for y in range(len(pixel_timeseries)):
-        for x in range(len(pixel_timeseries[y])):
-            if pixel_timeseries[y][x] is not None:
-                np.save(output_dir / f"scan_posX{x:03d}_posY{y:03d}.npy", pixel_timeseries[y][x])
-                pbar.update(1)
+    for key, value in attrs.items():
+        value = make_json_serializable(value)
+        if value is None:
+            obj.attrs[key] = h5py.Empty("f")
+            continue
+        try:
+            obj.attrs[key] = value
+        except (TypeError, ValueError):
+            obj.attrs[key] = json.dumps(value)
 
 
-def write_async_spad_zarr(
-    path,
-    pixel_timeseries,
-    T_exp=None,
-    attrs=None,
-    n_workers=8,
-    overwrite=True,
-):
+def _get_hdf5_attrs(obj):
     """
-    Write asynchronous SPAD data (per-pixel photon timestamps) to a Zarr group.
+    Read the attributes of an h5py file/group/dataset as a dict of plain Python values
+    (numpy scalars/arrays become Python scalars/lists, empty attributes become None).
+    Attributes stored as JSON strings by :func:`_set_hdf5_attrs` are returned as strings.
+    """
+    return {
+        key: None if isinstance(value, h5py.Empty) else make_json_serializable(value)
+        for key, value in obj.attrs.items()
+    }
 
-    The per-pixel arrays are flattened into a single ``t`` array in row-major pixel
-    order, indexed by ``offsets``/``lengths`` of shape (H, W), so pixel (i, j) is
-    ``t[offsets[i, j]:offsets[i, j] + lengths[i, j]]``. The matching event coordinates
-    are stored alongside as ``y``/``x``, so ``(t, y, x)`` is the flat event view of the
-    very same photons, in the same order.
 
-    This is the write counterpart to :func:`read_async_spad_zarr`.
+def _write_hdf5_dataset(group, name, arr, chunks=None):
+    """
+    Create a compressed dataset `name` in the h5py `group` and copy `arr` into it one
+    run of chunks (along axis 0) at a time.
+    """
+    arr = np.asarray(arr)
+    ds = group.create_dataset(
+        name,
+        shape=arr.shape,
+        dtype=arr.dtype,
+        # h5py rejects a chunk shape larger than an empty dataset, so let it pick one
+        chunks=chunks if arr.size else None,
+        **HDF5_COMPRESSION,
+    )
+    step = ds.chunks[0]
+    for start in tqdm(range(0, arr.shape[0], step), desc=f"Writing {name}"):
+        ds[start:start + step] = arr[start:start + step]
+    return ds
+
+
+def _save_arrs_to_hdf5(data_dict, path, chunks=None, attrs=None, overwrite=True):
+    """
+    Save multiple numpy arrays as datasets at the root of an HDF5 file, with `attrs` set
+    on the root. HDF5 counterpart of :func:`save_arrs_to_zarr`.
 
     Args:
-        path (str or Path): path to the output Zarr group (e.g. "G.zarr").
-        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
-            arrays, as returned by :func:`read_async_spad_dir`. ``None`` entries are
-            treated as pixels with no photons.
-        T_exp (float or None): exposure/acquisition time in seconds, used for the
-            per-pixel photon rate statistics. If None, it is inferred from the latest
-            photon in `pixel_timeseries`, which is only a lower bound on the true
-            exposure (the detector is usually still running after the last photon), so
-            pass it explicitly when the rates need to be exact.
-        attrs (dict or None): extra attributes, merged over the computed metadata.
-        n_workers (int): number of worker threads writing arrays concurrently.
-        overwrite (bool): if True, overwrite an existing zarr at `path`.
+        data_dict (dict): mapping of name->numpy array to save.
+        path (str or Path): path to the output HDF5 file.
+        chunks (dict or None): mapping of name->chunk tuple; h5py picks the chunk
+            shape for arrays not in it.
+        attrs (dict or None): attribute metadata to set on the file's root group.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+    """
+    chunks = chunks or {}
+    with h5py.File(path, "w" if overwrite else "w-") as f:
+        _set_hdf5_attrs(f, attrs or {})
+        for key, arr in data_dict.items():
+            _write_hdf5_dataset(f, key, arr, chunks.get(key))
+    logger.info(f"Saved arrays to HDF5 at: {path}")
+
+
+def _open_hdf5_frames(path):
+    """
+    Open the HDF5 file at `path` read-only and return its ``frames`` dataset. The file
+    stays open for as long as the dataset is referenced.
+    """
+    f = h5py.File(path, "r")
+    if "frames" not in f:
+        keys = sorted(f.keys())
+        f.close()
+        raise KeyError(f"No frames dataset found in {path}. Available datasets: {keys}")
+    return f["frames"]
+
+
+# ---------------------------------------------------------------------------
+# Quanta data: (T, H, W) synchronous binary/count frames
+# ---------------------------------------------------------------------------
+def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
+    """
+    Cast quanta frames to uint8 and compute the metadata stored by the
+    ``write_quanta_*`` writers (see :func:`write_quanta_zarr`).
 
     Returns:
-        The written zarr group.
-    """
-    H = len(pixel_timeseries)
-    W = len(pixel_timeseries[0])
-    if any(len(row) != W for row in pixel_timeseries):
-        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
-
-    lengths = np.zeros((H, W), dtype="int64")
-    flat_list = []
-    for i in range(H):
-        for j in range(W):
-            arr = pixel_timeseries[i][j]
-            arr = np.asarray([] if arr is None else arr, dtype="float64")
-            lengths[i, j] = arr.size
-            flat_list.append(arr)
-    # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
-    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
-    t = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
-
-    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-    y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
-    x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
-
-    if T_exp is None:
-        if t.size == 0:
-            raise ValueError(
-                "T_exp cannot be inferred from an acquisition with no photons; pass T_exp."
-            )
-        T_exp = float(t.max())
-
-    pixel_photon_rates = lengths / T_exp
-    data = {
-        "t": t,
-        "y": y,
-        "x": x,
-        "offsets": offsets,
-        "lengths": lengths,
-    }
-    # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
-    chunks = {
-        # max(1, ...) so a dataset with no photons still gets a valid chunk shape
-        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
-        for key in ("t", "y", "x")
-    }
-    metadata = {
-        "T_exp": T_exp,
-        "H": H,
-        "W": W,
-        "shape": "(H, W)",
-        "npoints": int(t.size),
-        "avg_pts_persec_perpixel": np.mean(pixel_photon_rates),
-        "max_pts_persec_perpixel": np.max(pixel_photon_rates),
-        "min_pts_persec_perpixel": np.min(pixel_photon_rates),
-        "med_pts_persec_perpixel": np.median(pixel_photon_rates),
-        "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
-        **(attrs or {}),
-    }
-    return save_arrs_to_zarr(
-        data, path,
-        chunks=chunks,
-        n_workers=n_workers,
-        overwrite=overwrite,
-        attrs=metadata,
-    )
-
-
-def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
-    """
-    Write binary quanta frames to a Zarr group.
-
-    Originally write_quantaframes_zarr, then write_frames_zarr.
-
-    Args:
-        path (str or Path): Path to the output Zarr file.
-        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
-        T_exp (float): exposure time in seconds.
-        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
-        n_workers (int): number of worker threads writing arrays concurrently.
+        tuple: ``(frames, attrs)``.
     """
     if T_exp is None:
         if fps is not None:
@@ -379,365 +355,21 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
     med_pts_persec_perpixel = np.median(npts_persec_perpix)
     stddev_pts_persec_perpixel = np.std(npts_persec_perpix, ddof=1)
     fps = fps or (frames.shape[0] / T_exp)
-    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
-    max_chunk_bytes = 200_000_000
-    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
-    quantadata = {
-        "frames": frames
+    attrs = {
+        "fps": fps,
+        "T_exp": T_exp,
+        "T": frames.shape[0],
+        "H": frames.shape[1],
+        "W": frames.shape[2],
+        "shape": "(T, H, W)",
+        "npoints": npoints,
+        "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
+        "max_pts_persec_perpixel": max_pts_persec_perpixel,
+        "min_pts_persec_perpixel": min_pts_persec_perpixel,
+        "med_pts_persec_perpixel": med_pts_persec_perpixel,
+        "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
     }
-    chunks = {
-        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
-    }
-    compressors = {
-        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-    }
-    save_arrs_to_zarr(
-        quantadata, path,
-        chunks=chunks,
-        n_workers=n_workers,
-        overwrite=True,
-        attrs={
-            "fps": fps,
-            "T_exp": T_exp,
-            "T": frames.shape[0],
-            "H": frames.shape[1],
-            "W": frames.shape[2],
-            "shape": "(T, H, W)",
-            "npoints": npoints,
-            "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
-            "max_pts_persec_perpixel": max_pts_persec_perpixel,
-            "min_pts_persec_perpixel": min_pts_persec_perpixel,
-            "med_pts_persec_perpixel": med_pts_persec_perpixel,
-            "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
-        },
-        compressor_dict=compressors,
-    )
-
-
-def write_quanta_gated_zarr(
-    path,
-    quanta_gated,
-    frames_per_chunk=None,
-    max_chunk_bytes=MAX_CHUNK_BYTES,
-    compressor=None,
-    attrs=None,
-    n_workers=8,
-    overwrite=True,
-):
-    """
-    Write a gated quanta acquisition to a single Zarr array (not a group) of shape
-    (n_frames, n_gate_steps, image_height, image_width), with the acquisition
-    metadata stored as array attributes.
-
-    Images are read and written chunk-by-chunk, so the full acquisition is never
-    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
-    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
-    summing over frames) touch whole chunks.
-
-    Args:
-        path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
-        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
-            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
-            acquisition metadata is attached.
-        frames_per_chunk (int or None): frames per chunk along the frame axis; if
-            None, the largest number that keeps a chunk under `max_chunk_bytes`.
-        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
-        compressor (codec or None): codec for compression (default: bitshuffle for
-            8-bit data, else shuffle).
-        attrs (dict or None): extra attributes, merged over the acquisition metadata.
-        n_workers (int): number of worker threads reading/writing chunks concurrently.
-        overwrite (bool): if True, overwrite an existing zarr at `path`.
-
-    Raises:
-        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
-            the image directory was passed instead).
-
-    Returns:
-        The written zarr array.
-    """
-    if not isinstance(quanta_gated, QuantaGatedDir):
-        if isinstance(quanta_gated, (str, Path)):
-            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
-        else:
-            hint = "QuantaGatedDir(image_dir, ...)"
-        raise TypeError(
-            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
-            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
-            f"alongside the images."
-        )
-    path = Path(path)
-    n_frames, n_gate_steps, height, width = quanta_gated.shape
-    if frames_per_chunk is None:
-        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
-    if compressor is None:
-        compressor = _default_compressor(quanta_gated.dtype)
-
-    def _create():
-        return zarr.create_array(
-            path,
-            shape=(n_frames, n_gate_steps, height, width),
-            dtype=quanta_gated.dtype,
-            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
-            compressors=compressor,
-            overwrite=overwrite,
-        )
-
-    try:
-        ds = _create()
-    except FileNotFoundError:
-        dot_clean_dir(path)
-        ds = _create()
-
-    ds_attrs = {
-        **quanta_gated.metadata,
-        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
-        "source_dir": str(quanta_gated.path),
-        **(attrs or {}),
-    }
-    for key, value in ds_attrs.items():
-        ds.attrs[key] = make_json_serializable(value)
-
-    tasks = [
-        (start, gate_idx)
-        for gate_idx in range(n_gate_steps)
-        for start in range(0, n_frames, frames_per_chunk)
-    ]
-
-    def write_chunk(task):
-        start, gate_idx = task
-        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
-        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
-
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
-    logger.info(f"Saved gated quanta to Zarr at: {path}")
-    return ds
-
-
-# ---------------------------------------------------------------------------
-# SPAD readers
-# ---------------------------------------------------------------------------
-def read_async_spad_dir(dirpath, h, w):
-    """
-    Reads a folder of .npy files containing per-pixel timestamp arrays.
-    Each .npy file is expected to be named with the pattern "posX{X}_posY{Y}.npy"
-    where {X} and {Y} are the pixel coordinates.
-
-    Originally read_spadfolder(dirpath, h, w, T_exp, keep_prob, normalize).
-
-    If there are multiple channels, there will be multiple folders. Run this for each
-    folder.
-
-    Timestamps and pixel coordinates are returned as stored, unnormalized; thin the
-    result with :func:`spadlib.processing.thin_events_uniform` if needed.
-
-    Returns:
-        tuple:
-            - points (np.ndarray): array of shape (N, 3) with columns [t, y, x].
-            - pixel_timeseries (list of lists): list of lists of arrays.
-    """
-    dirpath = Path(dirpath)
-    pixel_timeseries = [[None] * w for _ in range(h)]
-    all_points = []
-    for fn in tqdm(sorted(dirpath.glob("*.npy")), desc="Reading pixel timestamps from files"):
-        m = re.search(r"posX(\d+)_posY(\d+)", fn.stem)
-        if m is None:
-            logger.debug(f"skipping file with unexpected name: {fn.name}")
-            continue
-        px = int(m.group(1))
-        py = int(m.group(2))
-
-        timestamps = np.load(fn)
-        if timestamps.size == 0:
-            continue
-
-        x_vals = np.full(timestamps.shape[0], float(px))
-        y_vals = np.full(timestamps.shape[0], float(py))
-
-        pts = np.stack([
-            timestamps.astype("float64"),
-            y_vals,
-            x_vals
-        ], axis=1)
-        all_points.append(pts)
-        pixel_timeseries[py][px] = timestamps
-    points = np.vstack(all_points)
-    logger.info(f"Read {points.shape[0]} points from folder {dirpath}")
-    return points, pixel_timeseries
-
-
-# Piccolo 32x32 sensor: photon arrival is a coarse counter tick minus a fine counter
-# tick, and the coarse counter is 16 bits wide, so it wraps every PICCOLO_ROLLOVER_S.
-PICCOLO_COARSE_TICK_S = 6.25e-9
-PICCOLO_FINE_TICK_S = 50e-12
-PICCOLO_ROLLOVER_S = 2**16 * PICCOLO_COARSE_TICK_S
-
-
-def _find_piccolo_timestamp_mats(dirpath):
-    """
-    Return ``(indices, paths)`` for every ``timestamps_{n}.mat`` in `dirpath`, sorted by
-    the integer n. The index is not zero-padded on disk, so a plain string sort would be
-    wrong (``timestamps_10.mat`` before ``timestamps_2.mat``).
-    """
-    dirpath = Path(dirpath)
-    pat = re.compile(r"^timestamps_(\d+)\.mat$")
-    found = {}
-    for f in dirpath.iterdir():
-        m = pat.match(f.name)
-        if m:
-            found[int(m.group(1))] = f
-    if not found:
-        raise FileNotFoundError(f"No timestamps_*.mat files found in {dirpath}")
-    idxs = sorted(found)  # numeric (natural) order
-    return idxs, [found[i] for i in idxs]
-
-
-def read_async_spad_piccolo_dir(
-    dirpath,
-    acq_per,
-    rows=None,
-    cols=None,
-    transpose=False,
-    return_meta=False,
-):
-    """
-    Read asynchronous SPAD data from a directory of Piccolo 32x32 ``timestamps_{n}.mat``
-    files, one file per acquisition frame.
-
-    Each file holds two (H, W) object arrays of per-pixel counter values,
-    ``timestampsCounter1`` (coarse) and ``timestampsCounter2`` (fine); a photon's time
-    within its frame is ``coarse * PICCOLO_COARSE_TICK_S - fine * PICCOLO_FINE_TICK_S``.
-    Frame ``n`` starts at ``n * acq_per``, truncated down to a whole number of coarse
-    counter rollovers, since the counter's phase within a rollover is already carried by
-    the coarse value itself.
-
-    Files are read in natural numeric order and the first present index is treated as
-    frame 0. Gaps in the index sequence (missing files) are simply absent data, but the
-    true (gap-preserving) index places each frame in global time, so a missing frame does
-    not shift the timing of the frames that follow it. ``num_frames`` is therefore the
-    index span, not the file count, and ``T_exp = acq_per * num_frames``.
-
-    This is the Piccolo counterpart to :func:`read_async_spad_dir`, and its
-    `pixel_timeseries` can be passed straight to :func:`write_async_spad_zarr`.
-
-    Args:
-        dirpath (str or Path): directory of ``timestamps_{n}.mat`` files.
-        acq_per (float): acquisition period of one frame, in seconds.
-        rows, cols (array-like or None): sensor rows/columns to read (default: all). In
-            the returned grid, pixels outside the selection are ``None``, while selected
-            pixels that saw no photons are empty arrays.
-        transpose (bool): if True, read the raw counter arrays with their two sensor axes
-            swapped -- some captures store the array transposed. The returned grid is
-            still indexed ``[row][col]`` in output coordinates.
-        return_meta (bool): if True, also return a metadata dict.
-
-    Returns:
-        tuple: ``(points, pixel_timeseries)``, or ``(points, pixel_timeseries, meta)`` if
-        return_meta=True, where `points` is an (N, 3) array of [t, y, x] and `meta`
-        carries ``acq_per``, ``T_exp``, ``num_frames``, ``H``, ``W`` and
-        ``first_frame_index``.
-    """
-    import scipy.io
-
-    idxs, files = _find_piccolo_timestamp_mats(dirpath)
-    idx0 = idxs[0]                        # first present index -> treat as frame 0
-    num_frames = idxs[-1] - idx0 + 1      # span including any gaps
-    T_exp = acq_per * num_frames
-
-    chunks = None                         # (row, col) -> list of per-frame arrays
-    for idx, f in zip(tqdm(idxs, desc="Reading piccolo .mat files"), files):
-        n = idx - idx0                    # true frame index (preserves gaps)
-        mat = scipy.io.loadmat(f, squeeze_me=True)
-        c1 = mat["timestampsCounter1"]    # coarse counts, object array (H, W)
-        c2 = mat["timestampsCounter2"]    # fine counts, object array (H, W)
-        if transpose:
-            c1, c2 = c1.T, c2.T           # swap sensor axes for transposed captures
-        if chunks is None:
-            h, w = c1.shape
-            rows = np.arange(h) if rows is None else np.asarray(rows)
-            cols = np.arange(w) if cols is None else np.asarray(cols)
-            chunks = {(int(r), int(c)): [] for r in rows for c in cols}
-        # frame start, truncated to a whole number of coarse counter rollovers
-        frame_t0 = n * acq_per - np.mod(n * acq_per, PICCOLO_ROLLOVER_S)
-        for (r, c), parts in chunks.items():
-            parts.append(
-                PICCOLO_COARSE_TICK_S * np.atleast_1d(c1[r, c]).astype("float64")
-                - PICCOLO_FINE_TICK_S * np.atleast_1d(c2[r, c]).astype("float64")
-                + frame_t0
-            )
-
-    pixel_timeseries = [[None] * w for _ in range(h)]
-    all_points = []
-    for (r, c), parts in chunks.items():
-        timestamps = np.sort(np.concatenate(parts, dtype="float64"))
-        pixel_timeseries[r][c] = timestamps
-        if timestamps.size:
-            all_points.append(np.stack([
-                timestamps,
-                np.full(timestamps.size, float(r)),
-                np.full(timestamps.size, float(c)),
-            ], axis=1))
-
-    points = np.vstack(all_points) if all_points else np.empty((0, 3), dtype="float64")
-    logger.info(
-        f"Read {points.shape[0]} points from {len(idxs)} piccolo files in {dirpath} "
-        f"(num_frames={num_frames}, T_exp={T_exp})"
-    )
-    if return_meta:
-        meta = {
-            "acq_per": acq_per,
-            "T_exp": T_exp,
-            "num_frames": num_frames,
-            "H": h,
-            "W": w,
-            "first_frame_index": idx0,
-        }
-        return points, pixel_timeseries, meta
-    return points, pixel_timeseries
-
-
-def read_async_spad_zarr(path, load_data=False, return_meta=False):
-    """
-    Read asynchronous SPAD event data (per-pixel timestamps + flat coords) from a
-    Zarr group.
-
-    Originally read_asyncspad_zarr(path, load_data).
-
-    Args:
-        path (str or Path): path to the Zarr group.
-        load_data (bool): if True, read the (t, y, x) event coordinates into memory as
-            numpy arrays. If False (default), return the lazy zarr arrays. The per-pixel
-            timestamps are always read into memory.
-        return_meta (bool): if True, also return the group attributes.
-
-    Returns:
-        tuple: ``((t, y, x), pixel_timeseries)``, or
-        ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
-    """
-    root = zarr.open_group(path, mode="r")
-
-    # can't really lazily load this data
-    timestamps = root["t"][:]
-    offsets = root["offsets"][:]
-    lengths = root["lengths"][:]
-
-    H, W = offsets.shape
-    pixel_timeseries = [[None for _ in range(W)] for _ in range(H)]
-
-    for i in range(H):
-        for j in range(W):
-            start = offsets[i, j]
-            length = lengths[i, j]
-            pixel_timeseries[i][j] = timestamps[start: start + length]
-    # t is already in memory for the per-pixel slicing above
-    t = timestamps if load_data else root["t"]
-    y, x = root["y"], root["x"]
-    if load_data:
-        y = y[:]
-        x = x[:]
-    if return_meta:
-        return (t, y, x), pixel_timeseries, dict(root.attrs)
-    return (t, y, x), pixel_timeseries
+    return frames, attrs
 
 
 class LazyQuantaFrames:
@@ -887,20 +519,6 @@ class _QuantaMatFile:
         return np.transpose(arr, (2, 0, 1))
 
 
-def read_quanta_bin(path, H=512, W=512, load_data=False):
-    """
-    Read a single binary SPAD512 file.
-
-    Args:
-        load_data (bool): if True, read the whole file into memory as a numpy array. If
-            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
-
-    Ripped from spadtools (https://github.com/lyehe/spadtools).
-    """
-    frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
-    return frames[:] if load_data else frames
-
-
 def _inspect_mat_array(mat_path, key=None):
     """
     Find the array to read from a MATLAB ``.mat`` file and get its stored shape and
@@ -981,44 +599,6 @@ def _inspect_mat_array(mat_path, key=None):
         raise
 
 
-def read_quanta_mat(path, key=None, load_data=False):
-    """
-    Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
-    (consistent with :func:`read_quanta_bin`).
-
-    The volume is assumed to be stored as ``(H, W, T)`` (MATLAB WxHxT convention) and is
-    transposed to ``(T, H, W)`` on read. Dtype is preserved from the file.
-
-    Args:
-        path (str or Path): Path to the .mat file.
-        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
-            volume. If None, expects exactly one 3D array in the file.
-        load_data (bool): if True, read the whole volume into memory as a numpy array. If
-            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
-    """
-    frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
-    return frames[:] if load_data else frames
-
-
-def _ignore_dotfiles(paths):
-    """
-    Drop macOS dotfiles (``._*`` AppleDouble files, ``.DS_Store``) from a directory
-    listing, warning about any that were found.
-    """
-    kept, dotfiles = [], []
-    for p in paths:
-        (dotfiles if p.name.startswith(".") else kept).append(p)
-    if dotfiles:
-        names = ", ".join(sorted(p.name for p in dotfiles)[:5])
-        # dot_clean only exists on macOS, so only suggest it there
-        hint = " Run `dot_clean` there to remove them." if sys.platform == "darwin" else ""
-        logger.warning(
-            f"Ignoring {len(dotfiles)} macOS dotfile(s) in {dotfiles[0].parent}: {names}"
-            f"{'...' if len(dotfiles) > 5 else ''}.{hint}"
-        )
-    return kept
-
-
 def _read_mat_meta(path):
     """
     Read the optional MATLAB-volume metadata sidecar from a directory.
@@ -1070,7 +650,118 @@ def _read_quanta_mat_dir(path, matpaths, key=None, load_data=False):
     return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
 
 
-def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
+def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
+    """
+    Write binary quanta frames to a Zarr group.
+
+    Originally write_quantaframes_zarr, then write_frames_zarr.
+
+    Args:
+        path (str or Path): Path to the output Zarr file.
+        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
+        T_exp (float): exposure time in seconds.
+        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+        n_workers (int): number of worker threads writing arrays concurrently.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
+    max_chunk_bytes = 200_000_000
+    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
+    quantadata = {
+        "frames": frames
+    }
+    chunks = {
+        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
+    }
+    compressors = {
+        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+    }
+    save_arrs_to_zarr(
+        quantadata, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=True,
+        attrs=attrs,
+        compressor_dict=compressors,
+    )
+
+
+def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
+    """
+    Write binary quanta frames to an HDF5 file.
+
+    Same array and metadata as :func:`write_quanta_zarr`: a ``frames`` dataset at the
+    root of the file, with the metadata as root attributes.
+
+    Args:
+        path (str or Path): Path to the output HDF5 file.
+        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
+        T_exp (float): exposure time in seconds.
+        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frames_per_chunk = _frames_per_chunk(
+        frames.shape[0], frames.shape[1] * frames.shape[2], HDF5_MAX_CHUNK_BYTES
+    )
+    _save_arrs_to_hdf5(
+        {"frames": frames}, path,
+        chunks={"frames": (frames_per_chunk, frames.shape[1], frames.shape[2])},
+        attrs=attrs,
+    )
+
+
+def _bin_frame_shape(path, H, W):
+    """
+    Frame height/width for SPAD512 ``.bin`` files, which don't record them: a missing
+    (None) dimension defaults to 512, with a warning.
+    """
+    if H is None or W is None:
+        warnings.warn(
+            f"{Path(path).name}: frame size of .bin data not specified (H={H}, W={W}); "
+            f"assuming 512 for the missing dimension(s). Pass H and W explicitly to "
+            f"silence this warning.",
+            stacklevel=3,  # point at the caller of read_quanta_bin/read_quanta_dir
+        )
+    return (512 if H is None else H), (512 if W is None else W)
+
+
+def read_quanta_bin(path, H=None, W=None, load_data=False):
+    """
+    Read a single binary SPAD512 file.
+
+    Args:
+        H, W (int or None): Height and width of the frames, which the file does not
+            record. If None, defaults to 512 with a warning.
+        load_data (bool): if True, read the whole file into memory as a numpy array. If
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
+
+    Ripped from spadtools (https://github.com/lyehe/spadtools).
+    """
+    H, W = _bin_frame_shape(path, H, W)
+    frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
+    return frames[:] if load_data else frames
+
+
+def read_quanta_mat(path, key=None, load_data=False):
+    """
+    Read a single MATLAB ``.mat`` quanta volume and return it as ``(T, H, W)`` frames
+    (consistent with :func:`read_quanta_bin`).
+
+    The volume is assumed to be stored as ``(H, W, T)`` (MATLAB WxHxT convention) and is
+    transposed to ``(T, H, W)`` on read. Dtype is preserved from the file.
+
+    Args:
+        path (str or Path): Path to the .mat file.
+        key (str or None): Variable name (or HDF5 dataset path for v7.3) holding the
+            volume. If None, expects exactly one 3D array in the file.
+        load_data (bool): if True, read the whole volume into memory as a numpy array. If
+            False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
+    """
+    frames = LazyQuantaFrames([_QuantaMatFile(path, key=key)])
+    return frames[:] if load_data else frames
+
+
+def read_quanta_dir(path, H=None, W=None, key=None, load_data=False):
     """
     Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
     array.
@@ -1085,8 +776,9 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
       ``no_frames``) is used to validate the result if present.
 
     Args:
-        H, W (int): Height and width of the frames where it cannot be inferred (e.g.
-            SPAD512 .bin files). Ignored for .mat files, where they are inferred.
+        H, W (int or None): Height and width of the frames where it cannot be inferred
+            (e.g. SPAD512 .bin files); if None for .bin files, defaults to 512 with a
+            warning. Ignored for .mat files, where they are inferred.
         key (str or None): For .mat files, the variable/dataset name holding the volume.
             If None, expects exactly one 3D array per file.
         load_data (bool): if True, read all files into memory as a numpy array. If False
@@ -1099,6 +791,7 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
 
     binpaths = sorted(_ignore_dotfiles(path.glob("*.bin")), key=lambda p: natural_sort_key(p.name))
     if binpaths:
+        H, W = _bin_frame_shape(path, H, W)
         try:
             files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
             frames = LazyQuantaFrames(files)
@@ -1156,47 +849,35 @@ def read_quanta_zarr(path, load_data=False, return_meta=False):
     return (frames, dict(zarrdata.attrs)) if return_meta else frames
 
 
-def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
+def read_quanta_hdf5(path, load_data=False, return_meta=False):
     """
-    Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
-    array (not a group).
-
-    A gated acquisition is typically far too large to hold in memory (the reason it is
-    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place), so
-    the lazy zarr array is returned by default and sliced by the caller.
+    Read quanta frames from an HDF5 file written by :func:`write_quanta_hdf5`.
 
     Args:
-        path (str or Path): path to the Zarr array.
-        load_data (bool): if True, read the whole acquisition into memory as a numpy
-            array. If False (default), return the lazy zarr array.
-        return_meta (bool): if True, also return the array attributes (acquisition
-            metadata).
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy h5py dataset, which keeps the file open
+            (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the root attributes.
 
     Returns:
-        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
-        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
+        return_meta=True.
     """
-    try:
-        ds = zarr.open_array(path, mode="r")
-    except zarr.errors.NodeTypeValidationError as e:
-        raise ValueError(
-            f"{path} is a Zarr group, not a Zarr array; gated quanta are written as a "
-            f"single array by write_quanta_gated_zarr. Use read_quanta_zarr for group-based "
-            f"quanta data."
-        ) from e
-    if ds.ndim != 4:
-        raise ValueError(
-            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
-            f"array, got shape {ds.shape}"
-        )
-    frames = ds[:] if load_data else ds
-    return (frames, dict(ds.attrs)) if return_meta else frames
+    frames = _open_hdf5_frames(path)
+    attrs = _get_hdf5_attrs(frames.file)
+    if load_data:
+        f = frames.file
+        frames = frames[:]
+        f.close()
+    return (frames, attrs) if return_meta else frames
 
 
 def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
     """
     Automatically detects the format of the input path and reads the quanta data accordingly:
-    a .zarr group, a .bin file, a .mat file, or a directory of .bin/.mat files.
+    a .zarr group, a .h5/.hdf5 file, a .bin file, a .mat file, or a directory of .bin/.mat
+    files.
 
     Args:
         load_data (bool): If True, load the data into memory. If False (default), returns
@@ -1218,6 +899,10 @@ def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, k
         logger.info(f"Reading quanta from Zarr file: {path}")
         frames, metadata = read_quanta_zarr(path, load_data=load_data, return_meta=True)
         return (frames, metadata) if return_meta else frames
+    elif path.suffix in (".h5", ".hdf5"):
+        logger.info(f"Reading quanta from HDF5 file: {path}")
+        frames, metadata = read_quanta_hdf5(path, load_data=load_data, return_meta=True)
+        return (frames, metadata) if return_meta else frames
     elif path.suffix == ".bin":
         logger.info(f"Reading quanta from binary file: {path}")
         frames = read_quanta_bin(path, H=H, W=W, load_data=load_data)
@@ -1232,7 +917,428 @@ def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, k
 
 
 # ---------------------------------------------------------------------------
-# Gated quanta (SPAD512 PNG sequences)
+# Async SPAD data: asynchronous per-pixel photon timestamps
+# ---------------------------------------------------------------------------
+def _async_spad_arrays(pixel_timeseries, T_exp=None, attrs=None):
+    """
+    Flatten per-pixel timestamps into the arrays and metadata stored by the
+    ``write_async_spad_*`` writers (see :func:`write_async_spad_zarr`).
+
+    Returns:
+        tuple: ``(data, metadata)``, where `data` maps ``t``/``y``/``x``/``offsets``/
+        ``lengths`` to numpy arrays.
+    """
+    H = len(pixel_timeseries)
+    W = len(pixel_timeseries[0])
+    if any(len(row) != W for row in pixel_timeseries):
+        raise ValueError("All rows of pixel_timeseries must have the same length (W).")
+
+    lengths = np.zeros((H, W), dtype="int64")
+    flat_list = []
+    for i in range(H):
+        for j in range(W):
+            arr = pixel_timeseries[i][j]
+            arr = np.asarray([] if arr is None else arr, dtype="float64")
+            lengths[i, j] = arr.size
+            flat_list.append(arr)
+    # offsets[i, j] is where pixel (i, j)'s timestamps start in the flat array
+    offsets = np.concatenate([[0], np.cumsum(lengths)[:-1]]).reshape(H, W)
+    t = np.concatenate(flat_list) if flat_list else np.array([], dtype="float64")
+
+    ys, xs = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+    y = np.repeat(ys.ravel(), lengths.ravel()).astype("float64")
+    x = np.repeat(xs.ravel(), lengths.ravel()).astype("float64")
+
+    if T_exp is None:
+        if t.size == 0:
+            raise ValueError(
+                "T_exp cannot be inferred from an acquisition with no photons; pass T_exp."
+            )
+        T_exp = float(t.max())
+
+    pixel_photon_rates = lengths / T_exp
+    data = {
+        "t": t,
+        "y": y,
+        "x": x,
+        "offsets": offsets,
+        "lengths": lengths,
+    }
+    metadata = {
+        "T_exp": T_exp,
+        "H": H,
+        "W": W,
+        "shape": "(H, W)",
+        "npoints": int(t.size),
+        "avg_pts_persec_perpixel": np.mean(pixel_photon_rates),
+        "max_pts_persec_perpixel": np.max(pixel_photon_rates),
+        "min_pts_persec_perpixel": np.min(pixel_photon_rates),
+        "med_pts_persec_perpixel": np.median(pixel_photon_rates),
+        "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
+        **(attrs or {}),
+    }
+    return data, metadata
+
+
+def _read_async_spad_arrays(root, load_data=False):
+    """
+    Read the ``(t, y, x)`` events and per-pixel timestamps from a Zarr group or h5py file
+    laid out by the ``write_async_spad_*`` writers.
+    """
+    # can't really lazily load this data
+    timestamps = root["t"][:]
+    offsets = root["offsets"][:]
+    lengths = root["lengths"][:]
+
+    H, W = offsets.shape
+    pixel_timeseries = [[None for _ in range(W)] for _ in range(H)]
+
+    for i in range(H):
+        for j in range(W):
+            start = offsets[i, j]
+            length = lengths[i, j]
+            pixel_timeseries[i][j] = timestamps[start: start + length]
+    # t is already in memory for the per-pixel slicing above
+    t = timestamps if load_data else root["t"]
+    y, x = root["y"], root["x"]
+    if load_data:
+        y = y[:]
+        x = x[:]
+    return (t, y, x), pixel_timeseries
+
+
+# Piccolo 32x32 sensor: photon arrival is a coarse counter tick minus a fine counter
+# tick, and the coarse counter is 16 bits wide, so it wraps every PICCOLO_ROLLOVER_S.
+PICCOLO_COARSE_TICK_S = 6.25e-9
+PICCOLO_FINE_TICK_S = 50e-12
+PICCOLO_ROLLOVER_S = 2**16 * PICCOLO_COARSE_TICK_S
+
+
+def _find_piccolo_timestamp_mats(dirpath):
+    """
+    Return ``(indices, paths)`` for every ``timestamps_{n}.mat`` in `dirpath`, sorted by
+    the integer n. The index is not zero-padded on disk, so a plain string sort would be
+    wrong (``timestamps_10.mat`` before ``timestamps_2.mat``).
+    """
+    dirpath = Path(dirpath)
+    pat = re.compile(r"^timestamps_(\d+)\.mat$")
+    found = {}
+    for f in dirpath.iterdir():
+        m = pat.match(f.name)
+        if m:
+            found[int(m.group(1))] = f
+    if not found:
+        raise FileNotFoundError(f"No timestamps_*.mat files found in {dirpath}")
+    idxs = sorted(found)  # numeric (natural) order
+    return idxs, [found[i] for i in idxs]
+
+
+def write_async_spad_npys(pixel_timeseries, output_dir):
+    """
+    Save a list of lists of pixel timeseries to .npy files, where pixel_timeseries[y][x] is an array of timestamps for that pixel.
+    The files will be named with the pattern "scan_posX{X}_posY{Y}.npy" where {X} and {Y} are the pixel coordinates.
+
+    This is the write counterpart to :func:`read_async_spad_dir`.
+
+    Originally pixel_timeseries_to_npys(pixel_timeseries, output_dir), then
+    write_pixel_timeseries_npys(pixel_timeseries, output_dir).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pbar = tqdm(total=len(pixel_timeseries) * len(pixel_timeseries[0]), desc="Saving pixel timeseries to .npy files")
+    for y in range(len(pixel_timeseries)):
+        for x in range(len(pixel_timeseries[y])):
+            if pixel_timeseries[y][x] is not None:
+                np.save(output_dir / f"scan_posX{x:03d}_posY{y:03d}.npy", pixel_timeseries[y][x])
+                pbar.update(1)
+
+
+def write_async_spad_zarr(
+    path,
+    pixel_timeseries,
+    T_exp=None,
+    attrs=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Write asynchronous SPAD data (per-pixel photon timestamps) to a Zarr group.
+
+    The per-pixel arrays are flattened into a single ``t`` array in row-major pixel
+    order, indexed by ``offsets``/``lengths`` of shape (H, W), so pixel (i, j) is
+    ``t[offsets[i, j]:offsets[i, j] + lengths[i, j]]``. The matching event coordinates
+    are stored alongside as ``y``/``x``, so ``(t, y, x)`` is the flat event view of the
+    very same photons, in the same order.
+
+    This is the write counterpart to :func:`read_async_spad_zarr`.
+
+    Args:
+        path (str or Path): path to the output Zarr group (e.g. "G.zarr").
+        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
+            arrays, as returned by :func:`read_async_spad_dir`. ``None`` entries are
+            treated as pixels with no photons.
+        T_exp (float or None): exposure/acquisition time in seconds, used for the
+            per-pixel photon rate statistics. If None, it is inferred from the latest
+            photon in `pixel_timeseries`, which is only a lower bound on the true
+            exposure (the detector is usually still running after the last photon), so
+            pass it explicitly when the rates need to be exact.
+        attrs (dict or None): extra attributes, merged over the computed metadata.
+        n_workers (int): number of worker threads writing arrays concurrently.
+        overwrite (bool): if True, overwrite an existing zarr at `path`.
+
+    Returns:
+        The written zarr group.
+    """
+    data, metadata = _async_spad_arrays(pixel_timeseries, T_exp, attrs)
+    # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
+    chunks = {
+        # max(1, ...) so a dataset with no photons still gets a valid chunk shape
+        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
+        for key in ("t", "y", "x")
+    }
+    return save_arrs_to_zarr(
+        data, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=overwrite,
+        attrs=metadata,
+    )
+
+
+def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwrite=True):
+    """
+    Write asynchronous SPAD data (per-pixel photon timestamps) to an HDF5 file.
+
+    Same arrays and metadata as :func:`write_async_spad_zarr`: the ``t``/``y``/``x``/
+    ``offsets``/``lengths`` datasets at the root of the file, with the metadata as root
+    attributes.
+
+    This is the write counterpart to :func:`read_async_spad_hdf5`.
+
+    Args:
+        path (str or Path): path to the output HDF5 file (e.g. "G.h5").
+        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
+            arrays; see :func:`write_async_spad_zarr`.
+        T_exp (float or None): exposure/acquisition time in seconds; if None, inferred
+            from the latest photon (see :func:`write_async_spad_zarr`).
+        attrs (dict or None): extra attributes, merged over the computed metadata.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+    """
+    data, metadata = _async_spad_arrays(pixel_timeseries, T_exp, attrs)
+    chunks = {
+        key: (_frames_per_chunk(data[key].size, data[key].itemsize, HDF5_MAX_CHUNK_BYTES),)
+        for key in ("t", "y", "x")
+    }
+    _save_arrs_to_hdf5(data, path, chunks=chunks, attrs=metadata, overwrite=overwrite)
+
+
+def read_async_spad_dir(dirpath, h, w):
+    """
+    Reads a folder of .npy files containing per-pixel timestamp arrays.
+    Each .npy file is expected to be named with the pattern "posX{X}_posY{Y}.npy"
+    where {X} and {Y} are the pixel coordinates.
+
+    Originally read_spadfolder(dirpath, h, w, T_exp, keep_prob, normalize).
+
+    If there are multiple channels, there will be multiple folders. Run this for each
+    folder.
+
+    Timestamps and pixel coordinates are returned as stored, unnormalized; thin the
+    result with :func:`spadlib.processing.thin_events_uniform` if needed.
+
+    Returns:
+        tuple:
+            - points (np.ndarray): array of shape (N, 3) with columns [t, y, x].
+            - pixel_timeseries (list of lists): list of lists of arrays.
+    """
+    dirpath = Path(dirpath)
+    pixel_timeseries = [[None] * w for _ in range(h)]
+    all_points = []
+    for fn in tqdm(sorted(dirpath.glob("*.npy")), desc="Reading pixel timestamps from files"):
+        m = re.search(r"posX(\d+)_posY(\d+)", fn.stem)
+        if m is None:
+            logger.debug(f"skipping file with unexpected name: {fn.name}")
+            continue
+        px = int(m.group(1))
+        py = int(m.group(2))
+
+        timestamps = np.load(fn)
+        if timestamps.size == 0:
+            continue
+
+        x_vals = np.full(timestamps.shape[0], float(px))
+        y_vals = np.full(timestamps.shape[0], float(py))
+
+        pts = np.stack([
+            timestamps.astype("float64"),
+            y_vals,
+            x_vals
+        ], axis=1)
+        all_points.append(pts)
+        pixel_timeseries[py][px] = timestamps
+    points = np.vstack(all_points)
+    logger.info(f"Read {points.shape[0]} points from folder {dirpath}")
+    return points, pixel_timeseries
+
+
+def read_async_spad_piccolo_dir(
+    dirpath,
+    acq_per,
+    rows=None,
+    cols=None,
+    transpose=False,
+    return_meta=False,
+):
+    """
+    Read asynchronous SPAD data from a directory of Piccolo 32x32 ``timestamps_{n}.mat``
+    files, one file per acquisition frame.
+
+    Each file holds two (H, W) object arrays of per-pixel counter values,
+    ``timestampsCounter1`` (coarse) and ``timestampsCounter2`` (fine); a photon's time
+    within its frame is ``coarse * PICCOLO_COARSE_TICK_S - fine * PICCOLO_FINE_TICK_S``.
+    Frame ``n`` starts at ``n * acq_per``, truncated down to a whole number of coarse
+    counter rollovers, since the counter's phase within a rollover is already carried by
+    the coarse value itself.
+
+    Files are read in natural numeric order and the first present index is treated as
+    frame 0. Gaps in the index sequence (missing files) are simply absent data, but the
+    true (gap-preserving) index places each frame in global time, so a missing frame does
+    not shift the timing of the frames that follow it. ``num_frames`` is therefore the
+    index span, not the file count, and ``T_exp = acq_per * num_frames``.
+
+    This is the Piccolo counterpart to :func:`read_async_spad_dir`, and its
+    `pixel_timeseries` can be passed straight to :func:`write_async_spad_zarr`.
+
+    Args:
+        dirpath (str or Path): directory of ``timestamps_{n}.mat`` files.
+        acq_per (float): acquisition period of one frame, in seconds.
+        rows, cols (array-like or None): sensor rows/columns to read (default: all). In
+            the returned grid, pixels outside the selection are ``None``, while selected
+            pixels that saw no photons are empty arrays.
+        transpose (bool): if True, read the raw counter arrays with their two sensor axes
+            swapped -- some captures store the array transposed. The returned grid is
+            still indexed ``[row][col]`` in output coordinates.
+        return_meta (bool): if True, also return a metadata dict.
+
+    Returns:
+        tuple: ``(points, pixel_timeseries)``, or ``(points, pixel_timeseries, meta)`` if
+        return_meta=True, where `points` is an (N, 3) array of [t, y, x] and `meta`
+        carries ``acq_per``, ``T_exp``, ``num_frames``, ``H``, ``W`` and
+        ``first_frame_index``.
+    """
+    import scipy.io
+
+    idxs, files = _find_piccolo_timestamp_mats(dirpath)
+    idx0 = idxs[0]                        # first present index -> treat as frame 0
+    num_frames = idxs[-1] - idx0 + 1      # span including any gaps
+    T_exp = acq_per * num_frames
+
+    chunks = None                         # (row, col) -> list of per-frame arrays
+    for idx, f in zip(tqdm(idxs, desc="Reading piccolo .mat files"), files):
+        n = idx - idx0                    # true frame index (preserves gaps)
+        mat = scipy.io.loadmat(f, squeeze_me=True)
+        c1 = mat["timestampsCounter1"]    # coarse counts, object array (H, W)
+        c2 = mat["timestampsCounter2"]    # fine counts, object array (H, W)
+        if transpose:
+            c1, c2 = c1.T, c2.T           # swap sensor axes for transposed captures
+        if chunks is None:
+            h, w = c1.shape
+            rows = np.arange(h) if rows is None else np.asarray(rows)
+            cols = np.arange(w) if cols is None else np.asarray(cols)
+            chunks = {(int(r), int(c)): [] for r in rows for c in cols}
+        # frame start, truncated to a whole number of coarse counter rollovers
+        frame_t0 = n * acq_per - np.mod(n * acq_per, PICCOLO_ROLLOVER_S)
+        for (r, c), parts in chunks.items():
+            parts.append(
+                PICCOLO_COARSE_TICK_S * np.atleast_1d(c1[r, c]).astype("float64")
+                - PICCOLO_FINE_TICK_S * np.atleast_1d(c2[r, c]).astype("float64")
+                + frame_t0
+            )
+
+    pixel_timeseries = [[None] * w for _ in range(h)]
+    all_points = []
+    for (r, c), parts in chunks.items():
+        timestamps = np.sort(np.concatenate(parts, dtype="float64"))
+        pixel_timeseries[r][c] = timestamps
+        if timestamps.size:
+            all_points.append(np.stack([
+                timestamps,
+                np.full(timestamps.size, float(r)),
+                np.full(timestamps.size, float(c)),
+            ], axis=1))
+
+    points = np.vstack(all_points) if all_points else np.empty((0, 3), dtype="float64")
+    logger.info(
+        f"Read {points.shape[0]} points from {len(idxs)} piccolo files in {dirpath} "
+        f"(num_frames={num_frames}, T_exp={T_exp})"
+    )
+    if return_meta:
+        meta = {
+            "acq_per": acq_per,
+            "T_exp": T_exp,
+            "num_frames": num_frames,
+            "H": h,
+            "W": w,
+            "first_frame_index": idx0,
+        }
+        return points, pixel_timeseries, meta
+    return points, pixel_timeseries
+
+
+def read_async_spad_zarr(path, load_data=False, return_meta=False):
+    """
+    Read asynchronous SPAD event data (per-pixel timestamps + flat coords) from a
+    Zarr group.
+
+    Originally read_asyncspad_zarr(path, load_data).
+
+    Args:
+        path (str or Path): path to the Zarr group.
+        load_data (bool): if True, read the (t, y, x) event coordinates into memory as
+            numpy arrays. If False (default), return the lazy zarr arrays. The per-pixel
+            timestamps are always read into memory.
+        return_meta (bool): if True, also return the group attributes.
+
+    Returns:
+        tuple: ``((t, y, x), pixel_timeseries)``, or
+        ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
+    """
+    root = zarr.open_group(path, mode="r")
+    events, pixel_timeseries = _read_async_spad_arrays(root, load_data)
+    if return_meta:
+        return events, pixel_timeseries, dict(root.attrs)
+    return events, pixel_timeseries
+
+
+def read_async_spad_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read asynchronous SPAD event data (per-pixel timestamps + flat coords) from an HDF5
+    file written by :func:`write_async_spad_hdf5`.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the (t, y, x) event coordinates into memory as
+            numpy arrays. If False (default), return the lazy h5py datasets, which keep
+            the file open (read-only) for as long as they are referenced. The per-pixel
+            timestamps are always read into memory.
+        return_meta (bool): if True, also return the root attributes.
+
+    Returns:
+        tuple: ``((t, y, x), pixel_timeseries)``, or
+        ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
+    """
+    f = h5py.File(path, "r")
+    events, pixel_timeseries = _read_async_spad_arrays(f, load_data)
+    attrs = _get_hdf5_attrs(f)
+    if load_data:
+        f.close()
+    if return_meta:
+        return events, pixel_timeseries, attrs
+    return events, pixel_timeseries
+
+
+# ---------------------------------------------------------------------------
+# Gated quanta data: (n_frames, n_gate_steps, H, W) SPAD512 PNG sequences
 # ---------------------------------------------------------------------------
 class QuantaGatedDir:
     """
@@ -1451,6 +1557,244 @@ class QuantaGatedDir:
             stop = min(start + frames_per_chunk, self.n_frames)
             frame_slice = slice(start, stop)
             yield frame_slice, gate_idx, self.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+
+
+def _check_quanta_gated(quanta_gated):
+    """
+    Raise a TypeError unless `quanta_gated` is a :class:`QuantaGatedDir` (e.g. a path to
+    the image directory was passed instead).
+    """
+    if not isinstance(quanta_gated, QuantaGatedDir):
+        if isinstance(quanta_gated, (str, Path)):
+            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
+        else:
+            hint = "QuantaGatedDir(image_dir, ...)"
+        raise TypeError(
+            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
+            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
+            f"alongside the images."
+        )
+
+
+def _quanta_gated_attrs(quanta_gated, attrs=None):
+    """
+    Attributes stored by the ``write_quanta_gated_*`` writers: the acquisition metadata
+    plus `attrs` merged over it.
+    """
+    return {
+        **quanta_gated.metadata,
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+        "source_dir": str(quanta_gated.path),
+        **(attrs or {}),
+    }
+
+
+def write_quanta_gated_zarr(
+    path,
+    quanta_gated,
+    frames_per_chunk=None,
+    max_chunk_bytes=MAX_CHUNK_BYTES,
+    compressor=None,
+    attrs=None,
+    n_workers=8,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to a single Zarr array (not a group) of shape
+    (n_frames, n_gate_steps, image_height, image_width), with the acquisition
+    metadata stored as array attributes.
+
+    Images are read and written chunk-by-chunk, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), i.e.
+    a run of frames for a single gate step, so that per-gate-step reductions (e.g.
+    summing over frames) touch whole chunks.
+
+    Args:
+        path (str or Path): path to the output Zarr array (e.g. "gated.zarr").
+        quanta_gated (QuantaGatedDir): the acquisition to write. This is the reader
+            object, not a path: build it with ``QuantaGatedDir(image_dir, ...)`` so the
+            acquisition metadata is attached.
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        compressor (codec or None): codec for compression (default: bitshuffle for
+            8-bit data, else shuffle).
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        n_workers (int): number of worker threads reading/writing chunks concurrently.
+        overwrite (bool): if True, overwrite an existing zarr at `path`.
+
+    Raises:
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir` (e.g. a path to
+            the image directory was passed instead).
+
+    Returns:
+        The written zarr array.
+    """
+    _check_quanta_gated(quanta_gated)
+    path = Path(path)
+    n_frames, n_gate_steps, height, width = quanta_gated.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+    if compressor is None:
+        compressor = _default_compressor(quanta_gated.dtype)
+
+    def _create():
+        return zarr.create_array(
+            path,
+            shape=(n_frames, n_gate_steps, height, width),
+            dtype=quanta_gated.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            compressors=compressor,
+            overwrite=overwrite,
+        )
+
+    try:
+        ds = _create()
+    except FileNotFoundError:
+        dot_clean_dir(path)
+        ds = _create()
+
+    for key, value in _quanta_gated_attrs(quanta_gated, attrs).items():
+        ds.attrs[key] = make_json_serializable(value)
+
+    tasks = [
+        (start, gate_idx)
+        for gate_idx in range(n_gate_steps)
+        for start in range(0, n_frames, frames_per_chunk)
+    ]
+
+    def write_chunk(task):
+        start, gate_idx = task
+        frame_slice = slice(start, min(start + frames_per_chunk, n_frames))
+        ds[frame_slice, gate_idx] = quanta_gated.read_block(frame_slice, slice(gate_idx, gate_idx + 1))[:, 0]
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
+    logger.info(f"Saved gated quanta to Zarr at: {path}")
+    return ds
+
+
+def write_quanta_gated_hdf5(
+    path,
+    quanta_gated,
+    frames_per_chunk=None,
+    max_chunk_bytes=HDF5_MAX_CHUNK_BYTES,
+    attrs=None,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to an HDF5 file, as a single ``frames`` dataset of
+    shape (n_frames, n_gate_steps, image_height, image_width) with the acquisition
+    metadata stored as attributes of that dataset (the same attributes
+    :func:`write_quanta_gated_zarr` stores on its array).
+
+    Images are read and written one chunk at a time, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), as in
+    :func:`write_quanta_gated_zarr`.
+
+    Args:
+        path (str or Path): path to the output HDF5 file (e.g. "gated.h5").
+        quanta_gated (QuantaGatedDir): the acquisition to write (the reader object, not
+            a path).
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+
+    Raises:
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir`.
+    """
+    _check_quanta_gated(quanta_gated)
+    n_frames, _, height, width = quanta_gated.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+
+    with h5py.File(path, "w" if overwrite else "w-") as f:
+        ds = f.create_dataset(
+            "frames",
+            shape=quanta_gated.shape,
+            dtype=quanta_gated.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            **HDF5_COMPRESSION,
+        )
+        _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
+        for frame_slice, gate_idx, block in quanta_gated.iter_chunks(frames_per_chunk):
+            ds[frame_slice, gate_idx] = block
+    logger.info(f"Saved gated quanta to HDF5 at: {path}")
+
+
+def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
+    array (not a group).
+
+    A gated acquisition is typically far too large to hold in memory (the reason it is
+    chunked as (frames_per_chunk, 1, image_height, image_width) in the first place), so
+    the lazy zarr array is returned by default and sliced by the caller.
+
+    Args:
+        path (str or Path): path to the Zarr array.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy zarr array.
+        return_meta (bool): if True, also return the array attributes (acquisition
+            metadata).
+
+    Returns:
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+    """
+    try:
+        ds = zarr.open_array(path, mode="r")
+    except zarr.errors.NodeTypeValidationError as e:
+        raise ValueError(
+            f"{path} is a Zarr group, not a Zarr array; gated quanta are written as a "
+            f"single array by write_quanta_gated_zarr. Use read_quanta_zarr for group-based "
+            f"quanta data."
+        ) from e
+    if ds.ndim != 4:
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"array, got shape {ds.shape}"
+        )
+    frames = ds[:] if load_data else ds
+    return (frames, dict(ds.attrs)) if return_meta else frames
+
+
+def read_quanta_gated_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_hdf5` from the
+    ``frames`` dataset of an HDF5 file.
+
+    As with :func:`read_quanta_gated_zarr`, the lazy dataset is returned by default and
+    sliced by the caller.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy h5py dataset, which keeps the
+            file open (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the dataset attributes (acquisition
+            metadata).
+
+    Returns:
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+    """
+    ds = _open_hdf5_frames(path)
+    if ds.ndim != 4:
+        shape = ds.shape
+        ds.file.close()
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"frames dataset, got shape {shape}"
+        )
+    attrs = _get_hdf5_attrs(ds)
+    frames = ds
+    if load_data:
+        frames = ds[:]
+        ds.file.close()
+    return (frames, attrs) if return_meta else frames
 
 
 # ---------------------------------------------------------------------------

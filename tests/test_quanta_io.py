@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import zarr
 
-import spadlib.io as io
+import spadlib.utils as utils
 
 from spadlib.io import (
     read_quanta_auto,
@@ -98,11 +98,39 @@ def test_mat_dir_ignores_dotfiles(mat_dir, frames, caplog):
 @pytest.mark.parametrize("platform, expect_hint", [("darwin", True), ("linux", False)])
 def test_dotfile_warning_only_suggests_dot_clean_on_macos(bin_dir, monkeypatch, caplog, platform, expect_hint):
     """`dot_clean` is a macOS-only command."""
-    monkeypatch.setattr(io.sys, "platform", platform)
+    monkeypatch.setattr(utils.sys, "platform", platform)
     _add_dotfiles(bin_dir, ["._RAW00000.bin"])
     with caplog.at_level(logging.WARNING):
         read_quanta_dir(bin_dir, H=H, W=W)
     assert ("dot_clean" in caplog.text) is expect_hint
+
+
+# --- unspecified .bin frame size ------------------------------------------
+@pytest.mark.parametrize("fixture, reader", [
+    ("bin_path", read_quanta_bin),
+    ("bin_dir", read_quanta_dir),
+    ("bin_path", read_quanta_auto),
+    ("bin_dir", read_quanta_auto),
+])
+def test_bin_unspecified_size_warns_and_defaults_to_512(request, frames, fixture, reader):
+    with pytest.warns(UserWarning, match="frame size of .bin data not specified"):
+        _check(reader(request.getfixturevalue(fixture), load_data=True), frames)
+
+
+@pytest.mark.parametrize("fixture, reader", [
+    ("bin_path", lambda p: read_quanta_bin(p, H=H, W=W)),
+    ("bin_dir", lambda p: read_quanta_dir(p, H=H, W=W)),
+    ("mat_dir", read_quanta_dir),  # H/W don't apply to .mat files
+])
+def test_bin_size_warning_only_when_needed(request, recwarn, fixture, reader):
+    reader(request.getfixturevalue(fixture))
+    assert not any("frame size of .bin data not specified" in str(w.message) for w in recwarn)
+
+
+def test_bin_size_warning_points_at_caller(bin_path):
+    with pytest.warns(UserWarning) as record:
+        read_quanta_bin(bin_path)
+    assert record[0].filename == __file__
 
 
 # --- auto-detection dispatch ----------------------------------------------
