@@ -727,16 +727,33 @@ def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
     )
 
 
-def read_quanta_bin(path, H=512, W=512, load_data=False):
+def _bin_frame_shape(path, H, W):
+    """
+    Frame height/width for SPAD512 ``.bin`` files, which don't record them: a missing
+    (None) dimension defaults to 512, with a warning.
+    """
+    if H is None or W is None:
+        logger.warning(
+            f"{Path(path).name}: frame size of .bin data not specified (H={H}, W={W}); "
+            f"assuming 512 for the missing dimension(s). Pass H and W explicitly to "
+            f"silence this warning."
+        )
+    return (512 if H is None else H), (512 if W is None else W)
+
+
+def read_quanta_bin(path, H=None, W=None, load_data=False):
     """
     Read a single binary SPAD512 file.
 
     Args:
+        H, W (int or None): Height and width of the frames, which the file does not
+            record. If None, defaults to 512 with a warning.
         load_data (bool): if True, read the whole file into memory as a numpy array. If
             False (default), return a :class:`LazyQuantaFrames` that reads frames when indexed.
 
     Ripped from spadtools (https://github.com/lyehe/spadtools).
     """
+    H, W = _bin_frame_shape(path, H, W)
     frames = LazyQuantaFrames([_QuantaBinFile(path, H=H, W=W)])
     return frames[:] if load_data else frames
 
@@ -760,7 +777,7 @@ def read_quanta_mat(path, key=None, load_data=False):
     return frames[:] if load_data else frames
 
 
-def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
+def read_quanta_dir(path, H=None, W=None, key=None, load_data=False):
     """
     Read a directory of quanta files and concatenate them into a single ``(T, H, W)``
     array.
@@ -775,8 +792,9 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
       ``no_frames``) is used to validate the result if present.
 
     Args:
-        H, W (int): Height and width of the frames where it cannot be inferred (e.g.
-            SPAD512 .bin files). Ignored for .mat files, where they are inferred.
+        H, W (int or None): Height and width of the frames where it cannot be inferred
+            (e.g. SPAD512 .bin files); if None for .bin files, defaults to 512 with a
+            warning. Ignored for .mat files, where they are inferred.
         key (str or None): For .mat files, the variable/dataset name holding the volume.
             If None, expects exactly one 3D array per file.
         load_data (bool): if True, read all files into memory as a numpy array. If False
@@ -789,6 +807,7 @@ def read_quanta_dir(path, H=512, W=512, key=None, load_data=False):
 
     binpaths = sorted(_ignore_dotfiles(path.glob("*.bin")), key=lambda p: natural_sort_key(p.name))
     if binpaths:
+        H, W = _bin_frame_shape(path, H, W)
         try:
             files = [_QuantaBinFile(f, H=H, W=W) for f in binpaths]
             frames = LazyQuantaFrames(files)

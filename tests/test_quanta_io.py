@@ -105,6 +105,30 @@ def test_dotfile_warning_only_suggests_dot_clean_on_macos(bin_dir, monkeypatch, 
     assert ("dot_clean" in caplog.text) is expect_hint
 
 
+# --- unspecified .bin frame size ------------------------------------------
+@pytest.mark.parametrize("fixture, reader", [
+    ("bin_path", read_quanta_bin),
+    ("bin_dir", read_quanta_dir),
+    ("bin_path", read_quanta_auto),
+    ("bin_dir", read_quanta_auto),
+])
+def test_bin_unspecified_size_warns_and_defaults_to_512(request, frames, caplog, fixture, reader):
+    with caplog.at_level(logging.WARNING):
+        _check(reader(request.getfixturevalue(fixture), load_data=True), frames)
+    assert "frame size of .bin data not specified" in caplog.text
+
+
+@pytest.mark.parametrize("fixture, reader", [
+    ("bin_path", lambda p: read_quanta_bin(p, H=H, W=W)),
+    ("bin_dir", lambda p: read_quanta_dir(p, H=H, W=W)),
+    ("mat_dir", read_quanta_dir),  # H/W don't apply to .mat files
+])
+def test_bin_size_warning_only_when_needed(request, caplog, fixture, reader):
+    with caplog.at_level(logging.WARNING):
+        reader(request.getfixturevalue(fixture))
+    assert "frame size of .bin data not specified" not in caplog.text
+
+
 # --- auto-detection dispatch ----------------------------------------------
 def test_auto_zarr(zarr_path, frames):
     read_frames, meta = read_quanta_auto(zarr_path, load_data=True, return_meta=True)
