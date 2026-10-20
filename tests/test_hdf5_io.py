@@ -39,6 +39,7 @@ from tests.test_gated_quanta_io import (
 
 def _check_compression(ds):
     assert ds.compression == "gzip"
+    assert ds.compression_opts == 5
     assert ds.shuffle
 
 

@@ -239,7 +239,7 @@ def save_arr_to_zarr(
 # 1 MiB of chunks per dataset, so chunks are kept around that size; bigger chunks would
 # be decompressed again on every small (e.g. frame-by-frame) read.
 HDF5_MAX_CHUNK_BYTES = 1_048_576
-HDF5_COMPRESSION = {"compression": "gzip", "shuffle": True}
+HDF5_COMPRESSION = {"compression": "gzip", "compression_opts": 5, "shuffle": True}
 
 
 def _set_hdf5_attrs(obj, attrs):
