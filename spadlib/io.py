@@ -17,7 +17,9 @@ The representation names above (``frames``/``events``/``pixel_timeseries``) are 
 only by the format-conversion functions at the bottom of this module. Pre-convention
 names are kept as aliases at the end of the file.
 
-Also includes generic array <-> Zarr helpers used by the SPAD writers.
+Also includes generic array <-> Zarr helpers used by the SPAD writers. The HDF5 (h5py)
+readers/writers store the same arrays and metadata as their Zarr counterparts, GZIP
+compressed with the shuffle filter, and read/write single-threaded.
 """
 import json
 import logging
@@ -29,6 +31,7 @@ from pathlib import Path
 import warnings
 
 import cv2
+import h5py
 import numpy as np
 import zarr
 from tqdm import tqdm
@@ -225,6 +228,99 @@ def save_arr_to_zarr(
 
 
 # ---------------------------------------------------------------------------
+# Generic array <-> HDF5 helpers
+# ---------------------------------------------------------------------------
+# HDF5 decompresses a whole chunk on any partial read and by default caches only
+# 1 MiB of chunks per dataset, so chunks are kept around that size; bigger chunks would
+# be decompressed again on every small (e.g. frame-by-frame) read.
+HDF5_MAX_CHUNK_BYTES = 1_048_576
+HDF5_COMPRESSION = {"compression": "gzip", "shuffle": True}
+
+
+def _set_hdf5_attrs(obj, attrs):
+    """
+    Set `attrs` on an h5py file/group/dataset. Values are made JSON-serializable first,
+    like the Zarr writers do; None is stored as an empty attribute, and values HDF5 has
+    no native type for (e.g. dicts, mixed-type lists) as JSON strings.
+    """
+    for key, value in attrs.items():
+        value = make_json_serializable(value)
+        if value is None:
+            obj.attrs[key] = h5py.Empty("f")
+            continue
+        try:
+            obj.attrs[key] = value
+        except (TypeError, ValueError):
+            obj.attrs[key] = json.dumps(value)
+
+
+def _get_hdf5_attrs(obj):
+    """
+    Read the attributes of an h5py file/group/dataset as a dict of plain Python values
+    (numpy scalars/arrays become Python scalars/lists, empty attributes become None).
+    Attributes stored as JSON strings by :func:`_set_hdf5_attrs` are returned as strings.
+    """
+    return {
+        key: None if isinstance(value, h5py.Empty) else make_json_serializable(value)
+        for key, value in obj.attrs.items()
+    }
+
+
+def _write_hdf5_dataset(group, name, arr, chunks=None):
+    """
+    Create a compressed dataset `name` in the h5py `group` and copy `arr` into it one
+    run of chunks (along axis 0) at a time.
+    """
+    arr = np.asarray(arr)
+    ds = group.create_dataset(
+        name,
+        shape=arr.shape,
+        dtype=arr.dtype,
+        # h5py rejects a chunk shape larger than an empty dataset, so let it pick one
+        chunks=chunks if arr.size else None,
+        **HDF5_COMPRESSION,
+    )
+    step = ds.chunks[0]
+    for start in tqdm(range(0, arr.shape[0], step), desc=f"Writing {name}"):
+        ds[start:start + step] = arr[start:start + step]
+    return ds
+
+
+def _save_arrs_to_hdf5(data_dict, path, chunks=None, attrs=None, overwrite=True):
+    """
+    Save multiple numpy arrays as datasets at the root of an HDF5 file, with `attrs` set
+    on the root. HDF5 counterpart of :func:`save_arrs_to_zarr`.
+
+    Args:
+        data_dict (dict): mapping of name->numpy array to save.
+        path (str or Path): path to the output HDF5 file.
+        chunks (dict or None): mapping of name->chunk tuple; h5py picks the chunk
+            shape for arrays not in it.
+        attrs (dict or None): attribute metadata to set on the file's root group.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+    """
+    chunks = chunks or {}
+    with h5py.File(path, "w" if overwrite else "w-") as f:
+        _set_hdf5_attrs(f, attrs or {})
+        for key, arr in data_dict.items():
+            _write_hdf5_dataset(f, key, arr, chunks.get(key))
+    logger.info(f"Saved arrays to HDF5 at: {path}")
+
+
+def _open_hdf5_frames(path):
+    """
+    Open the HDF5 file at `path` read-only and return its ``frames`` dataset. The file
+    stays open for as long as the dataset is referenced.
+    """
+    f = h5py.File(path, "r")
+    if "frames" not in f:
+        keys = sorted(f.keys())
+        f.close()
+        raise KeyError(f"No frames dataset found in {path}. Available datasets: {keys}")
+    return f["frames"]
+
+
+# ---------------------------------------------------------------------------
 # SPAD writers
 # ---------------------------------------------------------------------------
 def write_async_spad_npys(pixel_timeseries, output_dir):
@@ -283,6 +379,31 @@ def write_async_spad_zarr(
     Returns:
         The written zarr group.
     """
+    data, metadata = _async_spad_arrays(pixel_timeseries, T_exp, attrs)
+    # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
+    chunks = {
+        # max(1, ...) so a dataset with no photons still gets a valid chunk shape
+        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
+        for key in ("t", "y", "x")
+    }
+    return save_arrs_to_zarr(
+        data, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=overwrite,
+        attrs=metadata,
+    )
+
+
+def _async_spad_arrays(pixel_timeseries, T_exp=None, attrs=None):
+    """
+    Flatten per-pixel timestamps into the arrays and metadata stored by the
+    ``write_async_spad_*`` writers (see :func:`write_async_spad_zarr`).
+
+    Returns:
+        tuple: ``(data, metadata)``, where `data` maps ``t``/``y``/``x``/``offsets``/
+        ``lengths`` to numpy arrays.
+    """
     H = len(pixel_timeseries)
     W = len(pixel_timeseries[0])
     if any(len(row) != W for row in pixel_timeseries):
@@ -319,12 +440,6 @@ def write_async_spad_zarr(
         "offsets": offsets,
         "lengths": lengths,
     }
-    # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
-    chunks = {
-        # max(1, ...) so a dataset with no photons still gets a valid chunk shape
-        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
-        for key in ("t", "y", "x")
-    }
     metadata = {
         "T_exp": T_exp,
         "H": H,
@@ -338,13 +453,34 @@ def write_async_spad_zarr(
         "stddev_pts_persec_perpixel": np.std(pixel_photon_rates, ddof=1),
         **(attrs or {}),
     }
-    return save_arrs_to_zarr(
-        data, path,
-        chunks=chunks,
-        n_workers=n_workers,
-        overwrite=overwrite,
-        attrs=metadata,
-    )
+    return data, metadata
+
+
+def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwrite=True):
+    """
+    Write asynchronous SPAD data (per-pixel photon timestamps) to an HDF5 file.
+
+    Same arrays and metadata as :func:`write_async_spad_zarr`: the ``t``/``y``/``x``/
+    ``offsets``/``lengths`` datasets at the root of the file, with the metadata as root
+    attributes.
+
+    This is the write counterpart to :func:`read_async_spad_hdf5`.
+
+    Args:
+        path (str or Path): path to the output HDF5 file (e.g. "G.h5").
+        pixel_timeseries (list of lists): H x W list of lists of per-pixel timestamp
+            arrays; see :func:`write_async_spad_zarr`.
+        T_exp (float or None): exposure/acquisition time in seconds; if None, inferred
+            from the latest photon (see :func:`write_async_spad_zarr`).
+        attrs (dict or None): extra attributes, merged over the computed metadata.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+    """
+    data, metadata = _async_spad_arrays(pixel_timeseries, T_exp, attrs)
+    chunks = {
+        key: (_frames_per_chunk(data[key].size, data[key].itemsize, HDF5_MAX_CHUNK_BYTES),)
+        for key in ("t", "y", "x")
+    }
+    _save_arrs_to_hdf5(data, path, chunks=chunks, attrs=metadata, overwrite=overwrite)
 
 
 def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
@@ -359,6 +495,37 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
         n_workers (int): number of worker threads writing arrays concurrently.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
+    max_chunk_bytes = 200_000_000
+    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
+    quantadata = {
+        "frames": frames
+    }
+    chunks = {
+        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
+    }
+    compressors = {
+        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
+    }
+    save_arrs_to_zarr(
+        quantadata, path,
+        chunks=chunks,
+        n_workers=n_workers,
+        overwrite=True,
+        attrs=attrs,
+        compressor_dict=compressors,
+    )
+
+
+def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
+    """
+    Cast quanta frames to uint8 and compute the metadata stored by the
+    ``write_quanta_*`` writers (see :func:`write_quanta_zarr`).
+
+    Returns:
+        tuple: ``(frames, attrs)``.
     """
     if T_exp is None:
         if fps is not None:
@@ -379,38 +546,44 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
     med_pts_persec_perpixel = np.median(npts_persec_perpix)
     stddev_pts_persec_perpixel = np.std(npts_persec_perpix, ddof=1)
     fps = fps or (frames.shape[0] / T_exp)
-    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
-    max_chunk_bytes = 200_000_000
-    max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
-    quantadata = {
-        "frames": frames
+    attrs = {
+        "fps": fps,
+        "T_exp": T_exp,
+        "T": frames.shape[0],
+        "H": frames.shape[1],
+        "W": frames.shape[2],
+        "shape": "(T, H, W)",
+        "npoints": npoints,
+        "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
+        "max_pts_persec_perpixel": max_pts_persec_perpixel,
+        "min_pts_persec_perpixel": min_pts_persec_perpixel,
+        "med_pts_persec_perpixel": med_pts_persec_perpixel,
+        "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
     }
-    chunks = {
-        "frames": (max_frames_per_chunk, frames.shape[1], frames.shape[2]),
-    }
-    compressors = {
-        "frames": zarr.codecs.BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-    }
-    save_arrs_to_zarr(
-        quantadata, path,
-        chunks=chunks,
-        n_workers=n_workers,
-        overwrite=True,
-        attrs={
-            "fps": fps,
-            "T_exp": T_exp,
-            "T": frames.shape[0],
-            "H": frames.shape[1],
-            "W": frames.shape[2],
-            "shape": "(T, H, W)",
-            "npoints": npoints,
-            "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
-            "max_pts_persec_perpixel": max_pts_persec_perpixel,
-            "min_pts_persec_perpixel": min_pts_persec_perpixel,
-            "med_pts_persec_perpixel": med_pts_persec_perpixel,
-            "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
-        },
-        compressor_dict=compressors,
+    return frames, attrs
+
+
+def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
+    """
+    Write binary quanta frames to an HDF5 file.
+
+    Same array and metadata as :func:`write_quanta_zarr`: a ``frames`` dataset at the
+    root of the file, with the metadata as root attributes.
+
+    Args:
+        path (str or Path): Path to the output HDF5 file.
+        frames (np.ndarray): Array of shape (T, H, W) with binary frames.
+        T_exp (float): exposure time in seconds.
+        fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+    """
+    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    frames_per_chunk = _frames_per_chunk(
+        frames.shape[0], frames.shape[1] * frames.shape[2], HDF5_MAX_CHUNK_BYTES
+    )
+    _save_arrs_to_hdf5(
+        {"frames": frames}, path,
+        chunks={"frames": (frames_per_chunk, frames.shape[1], frames.shape[2])},
+        attrs=attrs,
     )
 
 
@@ -455,16 +628,7 @@ def write_quanta_gated_zarr(
     Returns:
         The written zarr array.
     """
-    if not isinstance(quanta_gated, QuantaGatedDir):
-        if isinstance(quanta_gated, (str, Path)):
-            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
-        else:
-            hint = "QuantaGatedDir(image_dir, ...)"
-        raise TypeError(
-            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
-            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
-            f"alongside the images."
-        )
+    _check_quanta_gated(quanta_gated)
     path = Path(path)
     n_frames, n_gate_steps, height, width = quanta_gated.shape
     if frames_per_chunk is None:
@@ -488,13 +652,7 @@ def write_quanta_gated_zarr(
         dot_clean_dir(path)
         ds = _create()
 
-    ds_attrs = {
-        **quanta_gated.metadata,
-        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
-        "source_dir": str(quanta_gated.path),
-        **(attrs or {}),
-    }
-    for key, value in ds_attrs.items():
+    for key, value in _quanta_gated_attrs(quanta_gated, attrs).items():
         ds.attrs[key] = make_json_serializable(value)
 
     tasks = [
@@ -512,6 +670,86 @@ def write_quanta_gated_zarr(
         list(tqdm(executor.map(write_chunk, tasks), total=len(tasks), desc="Writing gated frames"))
     logger.info(f"Saved gated quanta to Zarr at: {path}")
     return ds
+
+
+def _check_quanta_gated(quanta_gated):
+    """
+    Raise a TypeError unless `quanta_gated` is a :class:`QuantaGatedDir` (e.g. a path to
+    the image directory was passed instead).
+    """
+    if not isinstance(quanta_gated, QuantaGatedDir):
+        if isinstance(quanta_gated, (str, Path)):
+            hint = f"QuantaGatedDir({str(quanta_gated)!r})"
+        else:
+            hint = "QuantaGatedDir(image_dir, ...)"
+        raise TypeError(
+            f"quanta_gated must be a QuantaGatedDir, not {type(quanta_gated).__name__}. "
+            f"Build the reader first, e.g. {hint}, so the acquisition metadata is written "
+            f"alongside the images."
+        )
+
+
+def _quanta_gated_attrs(quanta_gated, attrs=None):
+    """
+    Attributes stored by the ``write_quanta_gated_*`` writers: the acquisition metadata
+    plus `attrs` merged over it.
+    """
+    return {
+        **quanta_gated.metadata,
+        "shape": "(n_frames, n_gate_steps, image_height, image_width)",
+        "source_dir": str(quanta_gated.path),
+        **(attrs or {}),
+    }
+
+
+def write_quanta_gated_hdf5(
+    path,
+    quanta_gated,
+    frames_per_chunk=None,
+    max_chunk_bytes=HDF5_MAX_CHUNK_BYTES,
+    attrs=None,
+    overwrite=True,
+):
+    """
+    Write a gated quanta acquisition to an HDF5 file, as a single ``frames`` dataset of
+    shape (n_frames, n_gate_steps, image_height, image_width) with the acquisition
+    metadata stored as attributes of that dataset (the same attributes
+    :func:`write_quanta_gated_zarr` stores on its array).
+
+    Images are read and written one chunk at a time, so the full acquisition is never
+    held in memory. Chunks are (frames_per_chunk, 1, image_height, image_width), as in
+    :func:`write_quanta_gated_zarr`.
+
+    Args:
+        path (str or Path): path to the output HDF5 file (e.g. "gated.h5").
+        quanta_gated (QuantaGatedDir): the acquisition to write (the reader object, not
+            a path).
+        frames_per_chunk (int or None): frames per chunk along the frame axis; if
+            None, the largest number that keeps a chunk under `max_chunk_bytes`.
+        max_chunk_bytes (int): chunk size cap used when `frames_per_chunk` is None.
+        attrs (dict or None): extra attributes, merged over the acquisition metadata.
+        overwrite (bool): if True, overwrite an existing file at `path`.
+
+    Raises:
+        TypeError: if `quanta_gated` is not a :class:`QuantaGatedDir`.
+    """
+    _check_quanta_gated(quanta_gated)
+    n_frames, _, height, width = quanta_gated.shape
+    if frames_per_chunk is None:
+        frames_per_chunk = _frames_per_chunk(n_frames, quanta_gated.frame_nbytes, max_chunk_bytes)
+
+    with h5py.File(path, "w" if overwrite else "w-") as f:
+        ds = f.create_dataset(
+            "frames",
+            shape=quanta_gated.shape,
+            dtype=quanta_gated.dtype,
+            chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
+            **HDF5_COMPRESSION,
+        )
+        _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
+        for frame_slice, gate_idx, block in quanta_gated.iter_chunks(frames_per_chunk):
+            ds[frame_slice, gate_idx] = block
+    logger.info(f"Saved gated quanta to HDF5 at: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -715,7 +953,44 @@ def read_async_spad_zarr(path, load_data=False, return_meta=False):
         ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
     """
     root = zarr.open_group(path, mode="r")
+    events, pixel_timeseries = _read_async_spad_arrays(root, load_data)
+    if return_meta:
+        return events, pixel_timeseries, dict(root.attrs)
+    return events, pixel_timeseries
 
+
+def read_async_spad_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read asynchronous SPAD event data (per-pixel timestamps + flat coords) from an HDF5
+    file written by :func:`write_async_spad_hdf5`.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the (t, y, x) event coordinates into memory as
+            numpy arrays. If False (default), return the lazy h5py datasets, which keep
+            the file open (read-only) for as long as they are referenced. The per-pixel
+            timestamps are always read into memory.
+        return_meta (bool): if True, also return the root attributes.
+
+    Returns:
+        tuple: ``((t, y, x), pixel_timeseries)``, or
+        ``((t, y, x), pixel_timeseries, attrs)`` if return_meta=True.
+    """
+    f = h5py.File(path, "r")
+    events, pixel_timeseries = _read_async_spad_arrays(f, load_data)
+    attrs = _get_hdf5_attrs(f)
+    if load_data:
+        f.close()
+    if return_meta:
+        return events, pixel_timeseries, attrs
+    return events, pixel_timeseries
+
+
+def _read_async_spad_arrays(root, load_data=False):
+    """
+    Read the ``(t, y, x)`` events and per-pixel timestamps from a Zarr group or h5py file
+    laid out by the ``write_async_spad_*`` writers.
+    """
     # can't really lazily load this data
     timestamps = root["t"][:]
     offsets = root["offsets"][:]
@@ -735,8 +1010,6 @@ def read_async_spad_zarr(path, load_data=False, return_meta=False):
     if load_data:
         y = y[:]
         x = x[:]
-    if return_meta:
-        return (t, y, x), pixel_timeseries, dict(root.attrs)
     return (t, y, x), pixel_timeseries
 
 
@@ -1156,6 +1429,30 @@ def read_quanta_zarr(path, load_data=False, return_meta=False):
     return (frames, dict(zarrdata.attrs)) if return_meta else frames
 
 
+def read_quanta_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read quanta frames from an HDF5 file written by :func:`write_quanta_hdf5`.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy h5py dataset, which keeps the file open
+            (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the root attributes.
+
+    Returns:
+        frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
+        return_meta=True.
+    """
+    frames = _open_hdf5_frames(path)
+    attrs = _get_hdf5_attrs(frames.file)
+    if load_data:
+        f = frames.file
+        frames = frames[:]
+        f.close()
+    return (frames, attrs) if return_meta else frames
+
+
 def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
     """
     Read gated quanta frames written by :func:`write_quanta_gated_zarr` from a Zarr
@@ -1191,6 +1488,42 @@ def read_quanta_gated_zarr(path, load_data=False, return_meta=False):
         )
     frames = ds[:] if load_data else ds
     return (frames, dict(ds.attrs)) if return_meta else frames
+
+
+def read_quanta_gated_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read gated quanta frames written by :func:`write_quanta_gated_hdf5` from the
+    ``frames`` dataset of an HDF5 file.
+
+    As with :func:`read_quanta_gated_zarr`, the lazy dataset is returned by default and
+    sliced by the caller.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the whole acquisition into memory as a numpy
+            array. If False (default), return the lazy h5py dataset, which keeps the
+            file open (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the dataset attributes (acquisition
+            metadata).
+
+    Returns:
+        frames: (n_frames, n_gate_steps, image_height, image_width) array, lazy unless
+        load_data=True; or ``(frames, metadata)`` if return_meta=True.
+    """
+    ds = _open_hdf5_frames(path)
+    if ds.ndim != 4:
+        shape = ds.shape
+        ds.file.close()
+        raise ValueError(
+            f"{path}: expected a 4D (n_frames, n_gate_steps, image_height, image_width) "
+            f"frames dataset, got shape {shape}"
+        )
+    attrs = _get_hdf5_attrs(ds)
+    frames = ds
+    if load_data:
+        frames = ds[:]
+        ds.file.close()
+    return (frames, attrs) if return_meta else frames
 
 
 def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
