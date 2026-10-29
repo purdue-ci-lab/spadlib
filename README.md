@@ -58,10 +58,13 @@ vio.write_video(
     cmap="grey"  # supports any matplotlib colormap
 )
 
-hotpixel_corrected_frames = spproc.correct_hotpixels(frames[:])
+hotpixel_corrected_frames = spproc.correct_hotpixels(
+    frames[:],
+    bayer=True  # set to False if correcting SPAD 512 data
+)
 
 # convert to HDF5, which is quicker to read, has metadata, and stores compressed
-spio.write_quanta_hdf5("path/to/hotpixcorrected.h5", hotpixel_corrected_frames, fps=56_000)
+spio.write_quanta_hdf5("path/to/hotpixcorrected.h5", hotpixel_corrected_frames, fps=57_000)
 ```
 
 ## Data file formats

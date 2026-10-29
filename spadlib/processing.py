@@ -207,24 +207,44 @@ def accumulate_frames(frames, n, dtype=None, t_chunk=1000):
     return out
 
 
-def correct_hotpixels(frames, probablity_base="hotpixels", hp_threshold: float = 2.0, kernel_size: int = 3):
+def correct_hotpixels(frames, probablity_base="hotpixels", hp_threshold: float = 2.0, kernel_size: int = 3, bayer: bool = False):
     """
     Correct hot pixels in SPAD data using the SPADHotpixelTool.
 
     Args:
         frames: 3D numpy array of shape (T, H, W) representing the SPAD data.
         probablity_base: Base for probability calculation, either "hotpixels" or "all".
-        hp_threshold: Threshold multiplier for hot pixel detection.
+        hp_threshold: Number of standard deviations above the background to consider a pixel "hot".
         kernel_size: Size of the kernel for background estimation.
+        bayer: If True, treat frames as a 2x2 Bayer mosaic and correct each of the four
+            sub-planes (e.g. B, Gb, Gr, R) independently. Kernel size applies to the sub-planes.
     """
-    hotpixtool = SPADHotpixelTool(frames)
-    return hotpixtool.correct_hotpixels(probablity_base=probablity_base, hp_threshold=hp_threshold, kernel_size=kernel_size)
+    kwargs = dict(probablity_base=probablity_base, hp_threshold=hp_threshold, kernel_size=kernel_size)
+    if not bayer:
+        if frames.shape[-2:] == (1024, 1024):
+            warnings.warn(
+                "frames are 1024x1024, which suggests SPAD Alpha (Bayer) data; consider bayer=True.",
+                stacklevel=2,
+            )
+        return SPADHotpixelTool(frames).correct_hotpixels(**kwargs)
+    out = np.empty(frames.shape, dtype=np.uint8)
+    for dy in (0, 1):
+        for dx in (0, 1):
+            out[:, dy::2, dx::2] = SPADHotpixelTool(frames[:, dy::2, dx::2]).correct_hotpixels(**kwargs)
+    return out
 
 
 def correct_hotpixels_conv(arr, thresh_std=5.0, kernel_size=5):
     """
     Hot pixel correction via convolutional neighbor statistics.
+
+    This is old, and vibe coded and idk if this actuall works DON'T USE THIS PROBABLY.
     """
+    warnings.warn(
+        "correct_hotpixels_conv is deprecated and may not work correctly. Use processing.correct_hotpixels instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     arr = arr.copy()
     # count events per pixel over the whole timespan
     pixel_event_counts = np.sum(arr, axis=0).astype(float)
