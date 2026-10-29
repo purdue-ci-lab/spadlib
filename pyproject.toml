@@ -22,6 +22,7 @@ cupy13 = ["cupy-cuda13x"]
 
 [dependency-groups]
 dev = [
+    "jupyter>=1.1.1",
     "pytest>=9.1.1",
 ]
 
