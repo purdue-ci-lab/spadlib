@@ -239,7 +239,18 @@ def save_arr_to_zarr(
 # 1 MiB of chunks per dataset, so chunks are kept around that size; bigger chunks would
 # be decompressed again on every small (e.g. frame-by-frame) read.
 HDF5_MAX_CHUNK_BYTES = 1_048_576
-HDF5_COMPRESSION = {"compression": "gzip", "compression_opts": 5, "shuffle": True}
+HDF5_COMPRESSION_LEVEL = 5  # default GZIP level (0-9) of the HDF5 writers
+
+
+def _hdf5_compression(level):
+    """
+    ``create_dataset`` kwargs for GZIP compression at `level` with the shuffle filter.
+    Validated here, before any file is opened for writing, so a bad level can't leave an
+    existing file truncated.
+    """
+    if isinstance(level, bool) or not isinstance(level, (int, np.integer)) or not 0 <= level <= 9:
+        raise ValueError(f"compression_level must be an integer from 0 to 9, got {level!r}")
+    return {"compression": "gzip", "compression_opts": int(level), "shuffle": True}
 
 
 def _set_hdf5_attrs(obj, attrs):
@@ -271,10 +282,11 @@ def _get_hdf5_attrs(obj):
     }
 
 
-def _write_hdf5_dataset(group, name, arr, chunks=None):
+def _write_hdf5_dataset(group, name, arr, compression, chunks=None):
     """
-    Create a compressed dataset `name` in the h5py `group` and copy `arr` into it one
-    run of chunks (along axis 0) at a time.
+    Create a dataset `name` in the h5py `group`, compressed with the `compression`
+    kwargs from :func:`_hdf5_compression`, and copy `arr` into it one run of chunks
+    (along axis 0) at a time.
     """
     arr = np.asarray(arr)
     ds = group.create_dataset(
@@ -283,7 +295,7 @@ def _write_hdf5_dataset(group, name, arr, chunks=None):
         dtype=arr.dtype,
         # h5py rejects a chunk shape larger than an empty dataset, so let it pick one
         chunks=chunks if arr.size else None,
-        **HDF5_COMPRESSION,
+        **compression,
     )
     step = ds.chunks[0]
     for start in tqdm(range(0, arr.shape[0], step), desc=f"Writing {name}"):
@@ -291,7 +303,14 @@ def _write_hdf5_dataset(group, name, arr, chunks=None):
     return ds
 
 
-def _save_arrs_to_hdf5(data_dict, path, chunks=None, attrs=None, overwrite=True):
+def _save_arrs_to_hdf5(
+    data_dict,
+    path,
+    chunks=None,
+    attrs=None,
+    compression_level=HDF5_COMPRESSION_LEVEL,
+    overwrite=True,
+):
     """
     Save multiple numpy arrays as datasets at the root of an HDF5 file, with `attrs` set
     on the root. HDF5 counterpart of :func:`save_arrs_to_zarr`.
@@ -302,13 +321,15 @@ def _save_arrs_to_hdf5(data_dict, path, chunks=None, attrs=None, overwrite=True)
         chunks (dict or None): mapping of name->chunk tuple; h5py picks the chunk
             shape for arrays not in it.
         attrs (dict or None): attribute metadata to set on the file's root group.
+        compression_level (int): GZIP compression level, 0-9.
         overwrite (bool): if True, overwrite an existing file at `path`.
     """
     chunks = chunks or {}
+    compression = _hdf5_compression(compression_level)
     with h5py.File(path, "w" if overwrite else "w-") as f:
         _set_hdf5_attrs(f, attrs or {})
         for key, arr in data_dict.items():
-            _write_hdf5_dataset(f, key, arr, chunks.get(key))
+            _write_hdf5_dataset(f, key, arr, compression, chunks.get(key))
     logger.info(f"Saved arrays to HDF5 at: {path}")
 
 
@@ -686,7 +707,7 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
     )
 
 
-def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
+def write_quanta_hdf5(path, frames, T_exp=None, fps=None, compression_level=HDF5_COMPRESSION_LEVEL):
     """
     Write binary quanta frames to an HDF5 file.
 
@@ -698,6 +719,7 @@ def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
         frames (np.ndarray): Array of shape (T, H, W) with binary frames.
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+        compression_level (int): GZIP compression level, 0-9.
     """
     frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
     frames_per_chunk = _frames_per_chunk(
@@ -707,6 +729,7 @@ def write_quanta_hdf5(path, frames, T_exp=None, fps=None):
         {"frames": frames}, path,
         chunks={"frames": (frames_per_chunk, frames.shape[1], frames.shape[2])},
         attrs=attrs,
+        compression_level=compression_level,
     )
 
 
@@ -1105,7 +1128,14 @@ def write_async_spad_zarr(
     )
 
 
-def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwrite=True):
+def write_async_spad_hdf5(
+    path,
+    pixel_timeseries,
+    T_exp=None,
+    attrs=None,
+    compression_level=HDF5_COMPRESSION_LEVEL,
+    overwrite=True,
+):
     """
     Write asynchronous SPAD data (per-pixel photon timestamps) to an HDF5 file.
 
@@ -1122,6 +1152,7 @@ def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwr
         T_exp (float or None): exposure/acquisition time in seconds; if None, inferred
             from the latest photon (see :func:`write_async_spad_zarr`).
         attrs (dict or None): extra attributes, merged over the computed metadata.
+        compression_level (int): GZIP compression level, 0-9.
         overwrite (bool): if True, overwrite an existing file at `path`.
     """
     data, metadata = _async_spad_arrays(pixel_timeseries, T_exp, attrs)
@@ -1129,7 +1160,13 @@ def write_async_spad_hdf5(path, pixel_timeseries, T_exp=None, attrs=None, overwr
         key: (_frames_per_chunk(data[key].size, data[key].itemsize, HDF5_MAX_CHUNK_BYTES),)
         for key in ("t", "y", "x")
     }
-    _save_arrs_to_hdf5(data, path, chunks=chunks, attrs=metadata, overwrite=overwrite)
+    _save_arrs_to_hdf5(
+        data, path,
+        chunks=chunks,
+        attrs=metadata,
+        compression_level=compression_level,
+        overwrite=overwrite,
+    )
 
 
 def read_async_spad_dir(dirpath, h, w):
@@ -1747,6 +1784,7 @@ def write_quanta_gated_hdf5(
     frames_per_chunk=None,
     max_chunk_bytes=HDF5_MAX_CHUNK_BYTES,
     attrs=None,
+    compression_level=HDF5_COMPRESSION_LEVEL,
     overwrite=True,
 ):
     """
@@ -1776,13 +1814,16 @@ def write_quanta_gated_hdf5(
         attrs (dict or None): extra attributes, merged over the acquisition metadata.
             For an array, the acquisition metadata itself; the geometry
             (``n_frames`` etc.) is always taken from the array's shape.
+        compression_level (int): GZIP compression level, 0-9.
         overwrite (bool): if True, overwrite an existing file at `path`.
 
     Raises:
         TypeError: if `quanta_gated` is neither a :class:`QuantaGatedDir` nor an array.
-        ValueError: if `quanta_gated` is an array that is not 4D.
+        ValueError: if `quanta_gated` is an array that is not 4D, or
+            `compression_level` is not an integer from 0 to 9.
     """
     _check_quanta_gated(quanta_gated)
+    compression = _hdf5_compression(compression_level)
     n_frames, n_gate_steps, height, width = quanta_gated.shape
     if frames_per_chunk is None:
         frame_nbytes = height * width * np.dtype(quanta_gated.dtype).itemsize
@@ -1794,7 +1835,7 @@ def write_quanta_gated_hdf5(
             shape=quanta_gated.shape,
             dtype=quanta_gated.dtype,
             chunks=(frames_per_chunk, 1, height, width),  # a run of frames for one gate step
-            **HDF5_COMPRESSION,
+            **compression,
         )
         _set_hdf5_attrs(ds, _quanta_gated_attrs(quanta_gated, attrs))
         tasks = _quanta_gated_chunk_slices(n_frames, n_gate_steps, frames_per_chunk)

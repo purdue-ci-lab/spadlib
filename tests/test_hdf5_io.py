@@ -9,6 +9,7 @@ import pytest
 import zarr
 
 from spadlib.io import (
+    HDF5_COMPRESSION_LEVEL,
     HDF5_MAX_CHUNK_BYTES,
     QuantaGatedDir,
     read_async_spad_hdf5,
@@ -37,10 +38,53 @@ from tests.test_gated_quanta_io import (
 )
 
 
-def _check_compression(ds):
+def _check_compression(ds, level=HDF5_COMPRESSION_LEVEL):
     assert ds.compression == "gzip"
-    assert ds.compression_opts == 5
+    assert ds.compression_opts == level
     assert ds.shuffle
+
+
+def test_default_compression_level():
+    assert HDF5_COMPRESSION_LEVEL == 5
+
+
+def _write_each_hdf5(tmp_path, gated_images, **kwargs):
+    """Write one file with each HDF5 writer; returns their paths."""
+    paths = {
+        "async": tmp_path / "async.h5",
+        "quanta": tmp_path / "quanta.h5",
+        "gated": tmp_path / "gated.h5",
+    }
+    write_async_spad_hdf5(paths["async"], make_pixel_timeseries(), T_exp=T_EXP, **kwargs)
+    write_quanta_hdf5(paths["quanta"], gated_images[:, 0], T_exp=1.0, **kwargs)
+    write_quanta_gated_hdf5(paths["gated"], gated_images, **kwargs)
+    return paths
+
+
+@pytest.mark.parametrize("level", [0, 1, 9, np.int64(7)])
+def test_hdf5_writers_compression_level(tmp_path, level):
+    paths = _write_each_hdf5(tmp_path, make_gated_images(), compression_level=level)
+    for path in paths.values():
+        with h5py.File(path, "r") as f:
+            f.visititems(lambda _, obj: isinstance(obj, h5py.Dataset) and _check_compression(obj, level))
+
+
+@pytest.mark.parametrize("level", [-1, 10, 4.0, "5", True, None])
+def test_hdf5_writers_reject_bad_compression_level(tmp_path, level):
+    """A bad level is caught before the existing file is truncated."""
+    paths = _write_each_hdf5(tmp_path, make_gated_images())
+    before = {name: path.read_bytes() for name, path in paths.items()}
+    for name, write in (
+        ("async", lambda: write_async_spad_hdf5(
+            paths["async"], make_pixel_timeseries(), T_exp=T_EXP, compression_level=level)),
+        ("quanta", lambda: write_quanta_hdf5(
+            paths["quanta"], make_gated_images()[:, 0], T_exp=1.0, compression_level=level)),
+        ("gated", lambda: write_quanta_gated_hdf5(
+            paths["gated"], make_gated_images(), compression_level=level)),
+    ):
+        with pytest.raises(ValueError, match="compression_level"):
+            write()
+        assert paths[name].read_bytes() == before[name]
 
 
 # --- async SPAD -------------------------------------------------------------
