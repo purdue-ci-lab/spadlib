@@ -75,7 +75,8 @@ class cSPAD:
         self.info = self.t.recv(8191).decode('utf-8').split('\n')
         print(3, self.info)
        
-        if self.info[5][18:] == "1M":
+        if "1M" in self.info[5][18:]:
+            # example line: Hardware flavour: 1M (color)
             self.row = 1024
             self.col = [8, 16, 32, 64 , 128, 256, 512, 1024]
         else:
@@ -85,6 +86,19 @@ class cSPAD:
         self.intBitDepths = [1,4,6,7,8,9,10,11,12]
         self.gatedBitDepths = [4,6,7,8, 9, 10, 11, 12]
         print(4)
+
+    def close(self):
+        '''
+        Closes the TCPIP connection to the cSPAD system.
+
+        '''
+        self.t.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
     '''
                 ------------ Setting up functions ------------
@@ -333,6 +347,27 @@ class cSPAD:
         self.t.send(commandCooling)
         msg = self.t.recv(8191).decode('utf-8')
         return msg
+
+
+    def set_pileup(self, pileup):
+        '''
+        Sets the pileup correction mode for the SPAD512S system.
+
+        Parameters
+        ----------
+        pileup : int
+            1 for enabling pileup correction, 0 otherwise
+
+        Returns
+        -------
+        msg : string
+            Command response message.
+
+        '''
+        command = bytes("PU," + str(pileup), "utf-8")
+        self.t.send(command)
+        msg = self.t.recv(8191).decode('utf-8')
+        return msg
    
 
     def set_path(self, path):
@@ -359,8 +394,8 @@ class cSPAD:
     '''
           ------------ Intensity mode related functions ------------
     '''
-   
-    def get_intensity(self, iterations, intTime, bitDepth, overlap, timeout, pileup, im_width):
+
+    def get_intensity(self, iterations, intTime, bitDepth, overlap, im_width):
         '''
         Starts an intensity measurement with the SPAD512S system, and returns true shifted values.
 
@@ -391,12 +426,6 @@ class cSPAD:
             individual SPAD pixel.
 
         '''
-       
-        command = bytes("PU," + str(pileup), "utf8")
-        self.t.send(command)
-        time.sleep(0.1)
-        msg = self.t.recv(32768)
-        time.sleep(0.1)
         if not (bitDepth in self.intBitDepths):
             print("Chosen bit depth is invalid. Please use one of the following"
                   " values: %s.\nDefault value of 8bit is used instead!"
@@ -411,11 +440,6 @@ class cSPAD:
         command = bytes("I," + str(bitDepth) + ","+ str(intTime) + ","  +
                         str(iterations) + "," + "0," + str(overlap) + ",0" + ",1," + str(im_width), "utf8")
         self.t.send(command)
-        if timeout:
-            self.t.settimeout(5.0)  # Set a timeout of 5 seconds
-        else:
-            self.t.settimeout(None)  # Remove the timeout
-        time.sleep(1)
         data = bytearray()
         img = np.empty([self.row,im_width,iterations], dtype=np.uint16)
         if bitDepth == 1:
@@ -434,7 +458,7 @@ class cSPAD:
 
                     print(datablock[-160:])
                     print("Completed the run with errors")
-
+                    return None
 
             # remove DONE from the end of the data
             data = data[:-4]
@@ -500,8 +524,8 @@ class cSPAD:
                             new_array = (array_262144_odd.astype(np.uint32) * (2**8)) + (array_262144_even.astype(np.uint32))
                             img[:,:,i] = new_array.reshape((self.row, im_width))
 
-
-        return img  
+        # return as (T, H, W)
+        return img.transpose(2, 0, 1)
    
 
     '''
