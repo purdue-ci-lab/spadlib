@@ -184,6 +184,37 @@ def test_quanta_hdf5_roundtrip(tmp_path, frames):
     assert attrs == zattrs
 
 
+def test_quanta_avg_ppp(tmp_path, frames):
+    path = tmp_path / "data.h5"
+    write_quanta_hdf5(path, frames, T_exp=1.0)
+    _, attrs = read_quanta_hdf5(path, return_meta=True)
+    assert attrs["avg_ppp"] == pytest.approx(np.count_nonzero(frames) / frames.size)
+    assert attrs["npoints"] == np.count_nonzero(frames)
+
+
+def test_quanta_counts_multibit_photons(tmp_path):
+    frames = np.zeros((4, 2, 3), dtype=np.uint8)
+    frames[0, 0, 0] = 200
+    frames[1:, 1, 2] = 255  # pixel total 765 overflows uint8
+    path = tmp_path / "data.h5"
+    write_quanta_hdf5(path, frames, T_exp=1.0)
+    _, attrs = read_quanta_hdf5(path, return_meta=True)
+    assert attrs["npoints"] == 200 + 3 * 255
+    assert attrs["max_pts_persec_perpixel"] == 3 * 255
+    assert attrs["avg_ppp"] == pytest.approx((200 + 3 * 255) / frames.size)
+
+
+def test_quanta_writers_extra_attrs(tmp_path, frames):
+    extra = {"sensor": "SPAD512", "fps": 99.0}  # computed keys can be overridden
+    write_quanta_hdf5(tmp_path / "data.h5", frames, T_exp=1.0, attrs=extra)
+    write_quanta_zarr(tmp_path / "data.zarr", frames, T_exp=1.0, attrs=extra)
+    _, attrs = read_quanta_hdf5(tmp_path / "data.h5", return_meta=True)
+    _, zattrs = read_quanta_zarr(tmp_path / "data.zarr", return_meta=True)
+    assert attrs == zattrs
+    assert attrs["sensor"] == "SPAD512" and attrs["fps"] == 99.0
+    assert attrs["T"] == frames.shape[0]
+
+
 def test_quanta_hdf5_lazy_and_chunked(tmp_path, frames):
     path = tmp_path / "data.h5"
     write_quanta_hdf5(path, frames, fps=10.0)

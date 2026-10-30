@@ -349,13 +349,10 @@ def _open_hdf5_frames(path):
 # ---------------------------------------------------------------------------
 # Quanta data: (T, H, W) synchronous binary/count frames
 # ---------------------------------------------------------------------------
-def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
+def _quanta_attrs(frames, T_exp=None, fps=None, attrs=None):
     """
-    Cast quanta frames to uint8 and compute the metadata stored by the
-    ``write_quanta_*`` writers (see :func:`write_quanta_zarr`).
-
-    Returns:
-        tuple: ``(frames, attrs)``.
+    Compute the metadata stored by the ``write_quanta_*`` writers (see
+    :func:`write_quanta_zarr`), with the extra `attrs` merged over it.
     """
     if T_exp is None:
         if fps is not None:
@@ -366,17 +363,18 @@ def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
         raise ValueError("Only one of T_exp or fps should be provided")
     elif T_exp is not None and fps is None:
         fps = frames.shape[0] / T_exp
-    frames = np.asarray(frames, dtype="uint8")
-    npoints = np.count_nonzero(frames)
-    npts_persec_perpix = np.count_nonzero(frames, axis=0) / T_exp
+    npts_perpix = np.sum(frames, axis=0)  # sum, not count_nonzero, for multi-bit frames
+    npoints = npts_perpix.sum()
+    npts_persec_perpix = npts_perpix / T_exp
     # statistics
+    avg_ppp = npoints / (frames.shape[0] * frames.shape[1] * frames.shape[2])  # photons per pixel per frame
     avg_pts_persec_perpixel = npoints / (T_exp * frames.shape[1] * frames.shape[2])
     max_pts_persec_perpixel = np.max(npts_persec_perpix)
     min_pts_persec_perpixel = np.min(npts_persec_perpix)
     med_pts_persec_perpixel = np.median(npts_persec_perpix)
     stddev_pts_persec_perpixel = np.std(npts_persec_perpix, ddof=1)
     fps = fps or (frames.shape[0] / T_exp)
-    attrs = {
+    return {
         "fps": fps,
         "T_exp": T_exp,
         "T": frames.shape[0],
@@ -384,13 +382,14 @@ def _quanta_frames_and_attrs(frames, T_exp=None, fps=None):
         "W": frames.shape[2],
         "shape": "(T, H, W)",
         "npoints": npoints,
+        "avg_ppp": avg_ppp,
         "avg_pts_persec_perpixel": avg_pts_persec_perpixel,
         "max_pts_persec_perpixel": max_pts_persec_perpixel,
         "min_pts_persec_perpixel": min_pts_persec_perpixel,
         "med_pts_persec_perpixel": med_pts_persec_perpixel,
         "stddev_pts_persec_perpixel": stddev_pts_persec_perpixel,
+        **(attrs or {}),
     }
-    return frames, attrs
 
 
 class LazyQuantaFrames:
@@ -671,7 +670,7 @@ def _read_quanta_mat_dir(path, matpaths, key=None, load_data=False):
     return np.concatenate([f.read() for f in tqdm(files, desc="Reading .mat files from directory")], axis=0)
 
 
-def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
+def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8, attrs=None):
     """
     Write binary quanta frames to a Zarr group.
 
@@ -683,9 +682,10 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
         n_workers (int): number of worker threads writing arrays concurrently.
+        attrs (dict or None): extra attributes, merged over the computed metadata.
     """
-    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
-    frame_size_bytes = frames.shape[1] * frames.shape[2]  # H * W for uint8
+    attrs = _quanta_attrs(frames, T_exp=T_exp, fps=fps, attrs=attrs)
+    frame_size_bytes = frames.shape[1] * frames.shape[2] * np.dtype(frames.dtype).itemsize
     max_chunk_bytes = 200_000_000
     max_frames_per_chunk = max(1, max_chunk_bytes // frame_size_bytes)
     quantadata = {
@@ -707,7 +707,14 @@ def write_quanta_zarr(path, frames, T_exp=None, fps=None, n_workers=8):
     )
 
 
-def write_quanta_hdf5(path, frames, T_exp=None, fps=None, compression_level=HDF5_COMPRESSION_LEVEL):
+def write_quanta_hdf5(
+    path,
+    frames,
+    T_exp=None,
+    fps=None,
+    attrs=None,
+    compression_level=HDF5_COMPRESSION_LEVEL,
+):
     """
     Write binary quanta frames to an HDF5 file.
 
@@ -719,11 +726,14 @@ def write_quanta_hdf5(path, frames, T_exp=None, fps=None, compression_level=HDF5
         frames (np.ndarray): Array of shape (T, H, W) with binary frames.
         T_exp (float): exposure time in seconds.
         fps (float): if T_exp is None, fps must be provided to calculate T_exp.
+        attrs (dict or None): extra attributes, merged over the computed metadata.
         compression_level (int): GZIP compression level, 0-9.
     """
-    frames, attrs = _quanta_frames_and_attrs(frames, T_exp=T_exp, fps=fps)
+    attrs = _quanta_attrs(frames, T_exp=T_exp, fps=fps, attrs=attrs)
     frames_per_chunk = _frames_per_chunk(
-        frames.shape[0], frames.shape[1] * frames.shape[2], HDF5_MAX_CHUNK_BYTES
+        frames.shape[0],
+        frames.shape[1] * frames.shape[2] * np.dtype(frames.dtype).itemsize,
+        HDF5_MAX_CHUNK_BYTES,
     )
     _save_arrs_to_hdf5(
         {"frames": frames}, path,
