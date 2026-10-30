@@ -166,7 +166,7 @@ def test_hdf5_extra_attrs(tmp_path, pixel_timeseries):
     assert attrs["wavelengths"] == [450, 550]
     assert attrs["names"] == ["a", "b"]
     assert attrs["missing"] is None
-    assert attrs["nested"] == '{"a": 1}'  # no native HDF5 type: stored as JSON
+    assert attrs["nested"] == {"a": 1}  # no native HDF5 type: stored as JSON, decoded on read
 
 
 # --- quanta -----------------------------------------------------------------

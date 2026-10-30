@@ -1,21 +1,35 @@
 """
 Read/write utilities for color video and image data (as opposed to the SPAD
-quanta data handled by ``spadlib.io``). Also includes simple frame resizing.
+quanta data handled by ``spadlib.io``): video files, image directories, lazily read
+Phantom high-speed camera ``.cine`` files, and HDF5 video. Also includes hot pixel
+correction and simple frame resizing.
 """
 import contextlib
+import ctypes
 import logging
 import math
 import os
+import struct
 import subprocess
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+from pycine.file import read_header
+from pycine.linLUT import linLUT
 from tqdm import tqdm
 
-from spadlib.utils import natural_sort_key
+from spadlib.hdf5_utils import (
+    HDF5_COMPRESSION_LEVEL,
+    HDF5_MAX_CHUNK_BYTES,
+    _read_hdf5_frames,
+    _save_arrs_to_hdf5,
+)
+from spadlib.utils import _frames_per_chunk, _index_frames, natural_sort_key
 
 
 logger = logging.getLogger(__name__)
@@ -95,6 +109,344 @@ def read_image_dir(path, grayscale: bool = False) -> np.ndarray:
         images.append(arr)
 
     return np.array(images)
+
+
+# ---------------------------------------------------------------------------
+# Phantom .cine files
+# ---------------------------------------------------------------------------
+# biCompression values of the .cine image formats that can be read
+_CINE_UNCOMPRESSED = 0
+_CINE_PACKED_10BIT = 256  # 10-bit log-encoded values, 4 pixels packed into 5 bytes
+
+
+def _cine_header_value(value):
+    """
+    Convert a value of a pycine (ctypes) header to plain Python: structures become
+    dicts, arrays lists, and char arrays strings.
+    """
+    if isinstance(value, ctypes.Structure):
+        return {field[0]: _cine_header_value(getattr(value, field[0])) for field in value._fields_}
+    if isinstance(value, ctypes.Array):
+        if value._type_ is not ctypes.c_char:
+            return [_cine_header_value(v) for v in value]
+        value = value.value  # ctypes only gives bytes for top-level char arrays (not e.g. setup.BinName)
+    if isinstance(value, bytes):
+        # unused text fields can hold uninitialized junk, so don't fail on invalid UTF-8
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+class LazyCineFrames:
+    """
+    Lazy ``(T, H, W)`` frames of a Phantom ``.cine`` file. Returned by
+    :func:`read_video_cine` when ``load_data=False``.
+
+    Only the header is read at construction. Frames are read from disk and decoded when
+    indexed, `chunk_frames` at a time in `n_workers` threads; frames stored back to back
+    in the file are read as one block.
+
+    Frames are decoded exactly like :func:`pycine.raw.create_raw_array`: uncompressed
+    frames are flipped upright and rescaled from [BlackLevel, WhiteLevel] to
+    [0, 2**RealBPP - 1]; packed 10-bit frames are linearized with Phantom's lookup table
+    and rescaled to 12 bits. Frames are raw sensor values (a Bayer mosaic for color
+    cameras), not demosaiced.
+
+    Only integer and slice indexing (optionally with ``...``) is supported, with numpy
+    semantics; the result is a uint16 numpy array.
+
+    Args:
+        path (str or Path): path to the ``.cine`` file.
+        chunk_frames (int): number of frames read and decoded per thread task.
+        n_workers (int): number of threads reading/decoding frames.
+
+    Attributes:
+        header (dict): the pycine header (see :func:`pycine.file.read_header`).
+        bit_depth (int): bit depth of the decoded values (12 for packed 10-bit files).
+    """
+
+    def __init__(self, path, chunk_frames=64, n_workers=4):
+        self.path = Path(path)
+        self.chunk_frames = chunk_frames
+        self.n_workers = n_workers
+        self.header = read_header(self.path)
+        bih, setup = self.header["bitmapinfoheader"], self.header["setup"]
+        self.shape = (self.header["cinefileheader"].ImageCount, bih.biHeight, bih.biWidth)
+        self.dtype = np.dtype(np.uint16)
+        self._frame_offsets = np.asarray(self.header["pImage"], dtype=np.int64)
+
+        self._packed = bih.biCompression == _CINE_PACKED_10BIT
+        if self._packed:
+            self.bit_depth = 12
+            self._lut = np.interp(linLUT.astype(np.uint16), [64, 4064], [0, 2**12 - 1]).astype(np.uint16)
+            expected_image_size = bih.biHeight * bih.biWidth * 5 // 4
+        elif bih.biCompression == _CINE_UNCOMPRESSED and bih.biBitCount == 16:
+            self.bit_depth = setup.RealBPP
+            self._lut = np.interp(
+                np.arange(2**16), [setup.BlackLevel, setup.WhiteLevel], [0, 2**setup.RealBPP - 1]
+            ).astype(np.uint16)
+            expected_image_size = bih.biHeight * bih.biWidth * 2
+        else:
+            raise NotImplementedError(
+                f"Unsupported .cine image format: biCompression={bih.biCompression}, "
+                f"biBitCount={bih.biBitCount}"
+            )
+
+        # Each frame is an annotation, whose first 4 bytes are its size and last 4 bytes
+        # the image size, followed by the image. Phantom writes the same annotation for
+        # every frame, so the sizes are read from the first.
+        with open(self.path, "rb") as f:
+            f.seek(self._frame_offsets[0])
+            self._annotation_size = struct.unpack("<I", f.read(4))[0]
+            f.seek(self._frame_offsets[0] + self._annotation_size - 4)
+            self._image_size = struct.unpack("<I", f.read(4))[0]
+        if self._image_size != expected_image_size:
+            raise ValueError(
+                f"{self.path} has {self._image_size}-byte images, expected {expected_image_size} "
+                f"for {bih.biHeight}x{bih.biWidth} frames with biCompression={bih.biCompression}"
+            )
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __repr__(self):
+        return f"{type(self).__name__}(path={str(self.path)!r}, shape={self.shape}, dtype={self.dtype})"
+
+    def __getitem__(self, key):
+        return _index_frames(key, self.shape, self._read, type(self).__name__)
+
+    def _read(self, t_range, spatial_key):
+        """Frames at the increasing frame indices `t_range`, indexed by `spatial_key`."""
+        idxs = np.asarray(t_range, dtype=np.int64)
+        frame_shape = np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key].shape[1:]
+        out = np.empty((len(idxs), *frame_shape), dtype=self.dtype)
+
+        def load(start):
+            chunk = idxs[start:start + self.chunk_frames]
+            out[start:start + self.chunk_frames] = self._decode(self._read_raw(chunk))[spatial_key]
+
+        starts = range(0, len(idxs), self.chunk_frames)
+        with ThreadPoolExecutor(self.n_workers) as ex:
+            # only show progress for reads that take more than one round of threads
+            list(tqdm(
+                ex.map(load, starts), total=len(starts), desc="Reading .cine frames",
+                leave=False, disable=len(starts) <= self.n_workers,
+            ))
+        return out
+
+    def _read_raw(self, idxs):
+        """Raw image bytes of the frames `idxs`, as an (n_frames, image_size) uint8 array."""
+        offsets = self._frame_offsets[idxs]
+        frame_size = self._annotation_size + self._image_size
+        if np.all(np.diff(offsets) == frame_size):  # stored back to back: one read
+            raw = np.fromfile(self.path, dtype=np.uint8, count=len(idxs) * frame_size, offset=offsets[0])
+            raw = raw.reshape(len(idxs), frame_size)
+        else:
+            raw = np.stack([
+                np.fromfile(self.path, dtype=np.uint8, count=frame_size, offset=offset) for offset in offsets
+            ])
+        return raw[:, self._annotation_size:]
+
+    def _decode(self, raw):
+        """Decode raw image bytes from :meth:`_read_raw` to (n_frames, H, W) uint16 frames."""
+        n, (H, W) = len(raw), self.shape[1:]
+        if self._packed:
+            p = raw.reshape(n, -1, 5).astype(np.uint16)
+            vals = np.empty((n, p.shape[1], 4), dtype=np.uint16)
+            vals[..., 0] = (p[..., 0] << 2) | (p[..., 1] >> 6)
+            vals[..., 1] = ((p[..., 1] & 0b00111111) << 4) | (p[..., 2] >> 4)
+            vals[..., 2] = ((p[..., 2] & 0b00001111) << 6) | (p[..., 3] >> 2)
+            vals[..., 3] = ((p[..., 3] & 0b00000011) << 8) | p[..., 4]
+            return self._lut[vals.reshape(n, H, W)]
+        # uncompressed images are stored bottom-up
+        return self._lut[np.ascontiguousarray(raw).view(np.uint16).reshape(n, H, W)[:, ::-1]]
+
+
+def read_video_cine(path, load_data=False, return_meta=False, n_workers=4):
+    """
+    Read frames from a Phantom high-speed camera ``.cine`` file.
+
+    Args:
+        path (str or Path): path to the ``.cine`` file.
+        load_data (bool): if True, read all frames into memory as a numpy array. If False
+            (default), return a :class:`LazyCineFrames`, which reads frames when indexed.
+        return_meta (bool): if True, also return the metadata: ``fps``, ``T``, ``H``,
+            ``W``, ``shape`` and ``bit_depth`` (of the decoded values), plus the full
+            file header as the ``cinefileheader``, ``bitmapinfoheader`` and ``setup``
+            dicts. The header's table of frame offsets in the file is left out.
+        n_workers (int): number of threads reading/decoding frames.
+
+    Returns:
+        frames: (T, H, W) uint16 frames, lazy unless load_data=True; or
+        ``(frames, meta)`` if return_meta=True.
+    """
+    frames = LazyCineFrames(path, n_workers=n_workers)
+    if return_meta:
+        T, H, W = frames.shape
+        meta = {
+            "fps": frames.header["setup"].FrameRate,
+            "T": T,
+            "H": H,
+            "W": W,
+            "shape": "(T, H, W)",
+            "bit_depth": frames.bit_depth,
+            **{
+                key: _cine_header_value(frames.header[key])
+                for key in ("cinefileheader", "bitmapinfoheader", "setup")
+            },
+        }
+    if load_data:
+        frames = frames[:]
+    return (frames, meta) if return_meta else frames
+
+
+# ---------------------------------------------------------------------------
+# HDF5 video
+# ---------------------------------------------------------------------------
+def write_video_hdf5(path, frames, fps=None, attrs=None, compression_level=HDF5_COMPRESSION_LEVEL):
+    """
+    Write video frames to an HDF5 file: a ``frames`` dataset at the root of the file,
+    GZIP compressed with the shuffle filter, with the metadata as root attributes.
+
+    Frames are copied a run of chunks at a time, so a lazy source (e.g. from
+    :func:`read_video_cine`, or an h5py/zarr array) is never loaded whole. Each chunk
+    holds as many whole frames as fit in ``HDF5_MAX_CHUNK_BYTES`` (at least one).
+
+    To convert a ``.cine`` file, pass the lazy frames (or a slice of them) and their
+    metadata::
+
+        frames, meta = read_video_cine("video.cine", return_meta=True)
+        write_video_hdf5("video.h5", frames[1000:2000], attrs=meta)
+
+    Args:
+        path (str or Path): path to the output HDF5 file.
+        frames: (T, H, W) or (T, H, W, C) array, or a lazy array sliceable along T.
+        fps (float or None): frame rate. If None, the ``fps`` in `attrs` is kept
+            (stored as empty if there is none).
+        attrs (dict or None): extra attributes to store. The geometry (``T``, ``H``,
+            ``W``, ``C`` for 4D frames, and ``shape``) is always taken from `frames`.
+        compression_level (int): GZIP compression level, 0-9.
+
+    Raises:
+        ValueError: if `frames` is not 3D or 4D.
+    """
+    if len(frames.shape) not in (3, 4):
+        raise ValueError(f"frames must be (T, H, W) or (T, H, W, C), got shape {frames.shape}")
+    geometry = dict(zip("THWC", frames.shape))
+    geometry["shape"] = f"({', '.join(geometry)})"
+    attrs = {"fps": None, **(attrs or {}), **geometry}
+    if fps is not None:
+        attrs["fps"] = fps
+
+    frame_nbytes = math.prod(frames.shape[1:]) * np.dtype(frames.dtype).itemsize
+    frames_per_chunk = _frames_per_chunk(frames.shape[0], frame_nbytes, HDF5_MAX_CHUNK_BYTES)
+    _save_arrs_to_hdf5(
+        {"frames": frames}, path,
+        chunks={"frames": (frames_per_chunk, *frames.shape[1:])},
+        attrs=attrs,
+        compression_level=compression_level,
+    )
+
+
+def read_video_hdf5(path, load_data=False, return_meta=False):
+    """
+    Read video frames from an HDF5 file written by :func:`write_video_hdf5`.
+
+    Args:
+        path (str or Path): path to the HDF5 file.
+        load_data (bool): if True, read the frames into memory as a numpy array. If
+            False (default), return the lazy h5py dataset, which keeps the file open
+            (read-only) for as long as it is referenced.
+        return_meta (bool): if True, also return the root attributes.
+
+    Returns:
+        frames: (T, H, W) or (T, H, W, C) array, lazy unless load_data=True; or
+        ``(frames, attrs)`` if return_meta=True.
+    """
+    return _read_hdf5_frames(path, load_data=load_data, return_meta=return_meta)
+
+
+# ---------------------------------------------------------------------------
+# Hot pixel correction
+# ---------------------------------------------------------------------------
+def _locate_hotpixels(frames, hp_threshold, kernel_size, n_detect):
+    """Flag pixels that sit far above their local median in (the temporal median of) every frame."""
+    frames = frames[:: max(1, len(frames) // n_detect)]
+    residual = np.empty(frames.shape, dtype=np.float32)
+    for t, f in enumerate(frames):
+        f = np.ascontiguousarray(f, dtype=np.float32)
+        residual[t] = f - cv2.medianBlur(f, kernel_size)
+    # temporal median rejects transient bright features (moving highlights), keeps fixed-pattern ones
+    residual = np.median(residual, axis=0)
+    # sigma-clipped stats, so the threshold doesn't depend on how many hot pixels there are
+    keep = np.ones(residual.shape, dtype=bool)
+    for _ in range(5):
+        mean, std = residual[keep].mean(), residual[keep].std()
+        keep = residual < mean + 5 * std
+    return residual > mean + hp_threshold * std
+
+
+def _replace_hotpixels(sub, mask, kernel_size, chunk=1024):
+    """Replace masked pixels in `sub` (T, h, w), in place, with the per-frame median of non-hot neighbors."""
+    h, w = mask.shape
+    r = kernel_size // 2
+    ys, xs = np.nonzero(mask)
+    oy, ox = np.mgrid[-r : r + 1, -r : r + 1].reshape(2, -1)
+    center = (oy == 0) & (ox == 0)
+    oy, ox = oy[~center], ox[~center]
+    ny = np.clip(ys[:, None] + oy, 0, h - 1)  # (n_hot, n_neighbors)
+    nx = np.clip(xs[:, None] + ox, 0, w - 1)
+    invalid = mask[ny, nx]  # don't borrow from other hot pixels
+    for t0 in range(0, sub.shape[0], chunk):
+        vals = sub[t0 : t0 + chunk][:, ny, nx].astype(np.float32)
+        vals[:, invalid] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            med = np.nanmedian(vals, axis=-1)
+        med = np.where(np.isnan(med), sub[t0 : t0 + chunk][:, ys, xs], med)  # all neighbors hot: leave as is
+        if np.issubdtype(sub.dtype, np.integer):
+            med = np.rint(med)
+        sub[t0 : t0 + chunk, ys, xs] = med.astype(sub.dtype)
+
+
+def correct_hotpixels(frames, hp_threshold: float = 20.0, kernel_size: int = 3, bayer: bool = False, n_detect: int = 500, return_mask: bool = False):
+    """
+    Correct hot pixels in scalar-valued frames (e.g. Phantom cine data).
+
+    Hot pixels are located by subtracting a median-filtered background from each frame and taking
+    the temporal median of the residual, so only pixels that are bright in (nearly) every frame are
+    flagged, not moving highlights. Pixels whose residual exceeds mean + hp_threshold * std
+    (sigma-clipped) are hot. Each hot pixel is then replaced, frame by frame, by the median of its
+    non-hot neighbors.
+
+    Args:
+        frames: (T, H, W) or (H, W) array. Use raw (pre-debayer) frames.
+        hp_threshold: Number of standard deviations above the background to consider a pixel "hot".
+        kernel_size: Size of the kernel for background estimation and neighbor replacement (3 or 5).
+        bayer: If True, treat frames as a 2x2 Bayer mosaic and correct each of the four
+            sub-planes independently. Kernel size applies to the sub-planes.
+        n_detect: Max number of (evenly spaced) frames used for detection.
+        return_mask: If True, also return the (H, W) boolean hot pixel mask.
+    """
+    frames = np.asarray(frames)
+    squeeze = frames.ndim == 2
+    if squeeze:
+        frames = frames[None]
+    out = frames.copy()
+    mask = np.zeros(frames.shape[-2:], dtype=bool)
+    s = 2 if bayer else 1
+    for dy in range(s):
+        for dx in range(s):
+            sub = out[:, dy::s, dx::s]
+            m = _locate_hotpixels(sub, hp_threshold, kernel_size, n_detect)
+            _replace_hotpixels(sub, m, kernel_size)
+            mask[dy::s, dx::s] = m
+    if squeeze:
+        out = out[0]
+    return (out, mask) if return_mask else out
 
 
 def write_video(
