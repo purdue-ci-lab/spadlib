@@ -60,6 +60,60 @@ def _ignore_dotfiles(paths):
     return kept
 
 
+def _frames_per_chunk(n_frames, frame_nbytes, max_chunk_bytes):
+    """
+    Number of frames per chunk such that a chunk stays under `max_chunk_bytes`
+    (at least 1 frame, at most all of them).
+    """
+    return int(min(max(1, max_chunk_bytes // frame_nbytes), n_frames))
+
+
+def _index_frames(key, shape, read, name):
+    """
+    Index lazily read frames of `shape` with numpy semantics. Only integer and slice
+    indexing (optionally with ``...``) is supported; the result is a numpy array.
+
+    Args:
+        key: the index.
+        shape (tuple): shape of the frames, frames along axis 0.
+        read (callable): ``read(t_range, spatial_key)`` returns the frames at the
+            increasing frame indices `t_range` (a range), indexed along the remaining
+            axes by `spatial_key` (whose first element is a full slice).
+        name (str): class name for error messages.
+    """
+    ndim = len(shape)
+    if not isinstance(key, tuple):
+        key = (key,)
+    for k in key:
+        if not (k is Ellipsis or isinstance(k, slice) or (isinstance(k, (int, np.integer)) and not isinstance(k, bool))):
+            raise TypeError(f"{name} only supports integer and slice indexing, got {k!r}")
+    n_ellipsis = sum(k is Ellipsis for k in key)
+    if n_ellipsis > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    if n_ellipsis:
+        i = next(i for i, k in enumerate(key) if k is Ellipsis)
+        key = key[:i] + (slice(None),) * (ndim - len(key) + 1) + key[i + 1:]
+    if len(key) > ndim:
+        raise IndexError(f"too many indices for array: array is {ndim}-dimensional, but {len(key)} were indexed")
+    spatial_key = (slice(None), *key[1:])
+
+    t_idx = range(shape[0])[key[0]]  # int (IndexError if out of range) or range
+    is_int = not isinstance(t_idx, range)
+    t_range = range(t_idx, t_idx + 1) if is_int else t_idx
+    # read in increasing frame order, then flip back
+    reverse = t_range.step < 0
+    if reverse:
+        t_range = t_range[::-1]
+
+    frames = read(t_range, spatial_key)
+    if reverse:
+        frames = frames[::-1]
+    if not is_int:
+        return frames
+    # like numpy, an all-integer index with an ellipsis gives a 0-d array, not a scalar
+    return frames[0, ...] if n_ellipsis else frames[0]
+
+
 def is_json_serializable(x):
     """
     Return True if `x` can be serialized by `json.dumps`, False otherwise.

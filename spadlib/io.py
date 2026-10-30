@@ -19,7 +19,8 @@ names are kept as aliases at the end of the file.
 
 Also includes generic array <-> Zarr helpers used by the SPAD writers. The HDF5 (h5py)
 readers/writers store the same arrays and metadata as their Zarr counterparts, GZIP
-compressed with the shuffle filter, and read/write single-threaded.
+compressed with the shuffle filter, and read/write single-threaded; their shared
+helpers are in ``spadlib.hdf5_utils``.
 """
 import json
 import logging
@@ -35,9 +36,21 @@ import numpy as np
 import zarr
 from tqdm import tqdm
 
+from spadlib.hdf5_utils import (
+    HDF5_COMPRESSION_LEVEL,
+    HDF5_MAX_CHUNK_BYTES,
+    _get_hdf5_attrs,
+    _hdf5_compression,
+    _open_hdf5_frames,
+    _read_hdf5_frames,
+    _save_arrs_to_hdf5,
+    _set_hdf5_attrs,
+)
 from spadlib.processing import correct_hotpixels_conv, thin_events_uniform, thin_frames_uniform
 from spadlib.utils import (
+    _frames_per_chunk,
     _ignore_dotfiles,
+    _index_frames,
     dot_clean_dir,
     is_json_serializable,
     make_json_serializable,
@@ -59,14 +72,6 @@ logger = logging.getLogger(__name__)
 # Zarr recommends chunks of at least a few MB and no more than a few tens of MB;
 # used to cap how many frames go into one chunk along the frame axis.
 MAX_CHUNK_BYTES = 32_000_000
-
-
-def _frames_per_chunk(n_frames, frame_nbytes, max_chunk_bytes=MAX_CHUNK_BYTES):
-    """
-    Number of frames per chunk such that a chunk stays under `max_chunk_bytes`
-    (at least 1 frame, at most all of them).
-    """
-    return int(min(max(1, max_chunk_bytes // frame_nbytes), n_frames))
 
 
 def _write_arr_chunks(ds, arr, n_workers, desc):
@@ -233,120 +238,6 @@ def save_arr_to_zarr(
 
 
 # ---------------------------------------------------------------------------
-# Generic array <-> HDF5 helpers
-# ---------------------------------------------------------------------------
-# HDF5 decompresses a whole chunk on any partial read and by default caches only
-# 1 MiB of chunks per dataset, so chunks are kept around that size; bigger chunks would
-# be decompressed again on every small (e.g. frame-by-frame) read.
-HDF5_MAX_CHUNK_BYTES = 1_048_576
-HDF5_COMPRESSION_LEVEL = 5  # default GZIP level (0-9) of the HDF5 writers
-
-
-def _hdf5_compression(level):
-    """
-    ``create_dataset`` kwargs for GZIP compression at `level` with the shuffle filter.
-    Validated here, before any file is opened for writing, so a bad level can't leave an
-    existing file truncated.
-    """
-    if isinstance(level, bool) or not isinstance(level, (int, np.integer)) or not 0 <= level <= 9:
-        raise ValueError(f"compression_level must be an integer from 0 to 9, got {level!r}")
-    return {"compression": "gzip", "compression_opts": int(level), "shuffle": True}
-
-
-def _set_hdf5_attrs(obj, attrs):
-    """
-    Set `attrs` on an h5py file/group/dataset. Values are made JSON-serializable first,
-    like the Zarr writers do; None is stored as an empty attribute, and values HDF5 has
-    no native type for (e.g. dicts, mixed-type lists) as JSON strings.
-    """
-    for key, value in attrs.items():
-        value = make_json_serializable(value)
-        if value is None:
-            obj.attrs[key] = h5py.Empty("f")
-            continue
-        try:
-            obj.attrs[key] = value
-        except (TypeError, ValueError):
-            obj.attrs[key] = json.dumps(value)
-
-
-def _get_hdf5_attrs(obj):
-    """
-    Read the attributes of an h5py file/group/dataset as a dict of plain Python values
-    (numpy scalars/arrays become Python scalars/lists, empty attributes become None).
-    Attributes stored as JSON strings by :func:`_set_hdf5_attrs` are returned as strings.
-    """
-    return {
-        key: None if isinstance(value, h5py.Empty) else make_json_serializable(value)
-        for key, value in obj.attrs.items()
-    }
-
-
-def _write_hdf5_dataset(group, name, arr, compression, chunks=None):
-    """
-    Create a dataset `name` in the h5py `group`, compressed with the `compression`
-    kwargs from :func:`_hdf5_compression`, and copy `arr` into it one run of chunks
-    (along axis 0) at a time.
-    """
-    arr = np.asarray(arr)
-    ds = group.create_dataset(
-        name,
-        shape=arr.shape,
-        dtype=arr.dtype,
-        # h5py rejects a chunk shape larger than an empty dataset, so let it pick one
-        chunks=chunks if arr.size else None,
-        **compression,
-    )
-    step = ds.chunks[0]
-    for start in tqdm(range(0, arr.shape[0], step), desc=f"Writing {name}"):
-        ds[start:start + step] = arr[start:start + step]
-    return ds
-
-
-def _save_arrs_to_hdf5(
-    data_dict,
-    path,
-    chunks=None,
-    attrs=None,
-    compression_level=HDF5_COMPRESSION_LEVEL,
-    overwrite=True,
-):
-    """
-    Save multiple numpy arrays as datasets at the root of an HDF5 file, with `attrs` set
-    on the root. HDF5 counterpart of :func:`save_arrs_to_zarr`.
-
-    Args:
-        data_dict (dict): mapping of name->numpy array to save.
-        path (str or Path): path to the output HDF5 file.
-        chunks (dict or None): mapping of name->chunk tuple; h5py picks the chunk
-            shape for arrays not in it.
-        attrs (dict or None): attribute metadata to set on the file's root group.
-        compression_level (int): GZIP compression level, 0-9.
-        overwrite (bool): if True, overwrite an existing file at `path`.
-    """
-    chunks = chunks or {}
-    compression = _hdf5_compression(compression_level)
-    with h5py.File(path, "w" if overwrite else "w-") as f:
-        _set_hdf5_attrs(f, attrs or {})
-        for key, arr in data_dict.items():
-            _write_hdf5_dataset(f, key, arr, compression, chunks.get(key))
-    logger.info(f"Saved arrays to HDF5 at: {path}")
-
-
-def _open_hdf5_frames(path):
-    """
-    Open the HDF5 file at `path` read-only and return its ``frames`` dataset. The file
-    stays open for as long as the dataset is referenced.
-    """
-    f = h5py.File(path, "r")
-    if "frames" not in f:
-        keys = sorted(f.keys())
-        f.close()
-        raise KeyError(f"No frames dataset found in {path}. Available datasets: {keys}")
-    return f["frames"]
-
-
-# ---------------------------------------------------------------------------
 # Quanta data: (T, H, W) synchronous binary/count frames
 # ---------------------------------------------------------------------------
 def _quanta_attrs(frames, T_exp=None, fps=None, attrs=None):
@@ -431,29 +322,10 @@ class LazyQuantaFrames:
         return f"{type(self).__name__}(n_files={len(self._files)}, shape={self.shape}, dtype={self.dtype})"
 
     def __getitem__(self, key):
-        if not isinstance(key, tuple):
-            key = (key,)
-        for k in key:
-            if not (k is Ellipsis or isinstance(k, slice) or (isinstance(k, (int, np.integer)) and not isinstance(k, bool))):
-                raise TypeError(f"{type(self).__name__} only supports integer and slice indexing, got {k!r}")
-        n_ellipsis = sum(k is Ellipsis for k in key)
-        if n_ellipsis > 1:
-            raise IndexError("an index can only have a single ellipsis ('...')")
-        if n_ellipsis:
-            i = next(i for i, k in enumerate(key) if k is Ellipsis)
-            key = key[:i] + (slice(None),) * (self.ndim - len(key) + 1) + key[i + 1:]
-        if len(key) > self.ndim:
-            raise IndexError(f"too many indices for array: array is {self.ndim}-dimensional, but {len(key)} were indexed")
-        spatial_key = (slice(None), *key[1:])
+        return _index_frames(key, self.shape, self._read, type(self).__name__)
 
-        t_idx = range(self.shape[0])[key[0]]  # int (IndexError if out of range) or range
-        is_int = not isinstance(t_idx, range)
-        t_range = range(t_idx, t_idx + 1) if is_int else t_idx
-        # read in increasing frame order, then flip back
-        reverse = t_range.step < 0
-        if reverse:
-            t_range = t_range[::-1]
-
+    def _read(self, t_range, spatial_key):
+        """Frames at the increasing frame indices `t_range`, indexed by `spatial_key`."""
         pieces = []
         for f, start in zip(self._files, self._starts):
             # the elements of t_range that fall within this file
@@ -465,17 +337,10 @@ class LazyQuantaFrames:
                 pieces.append(f.read(sel)[spatial_key])
 
         if not pieces:
-            frames = np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key]
-        elif len(pieces) == 1:
-            frames = pieces[0]
-        else:
-            frames = np.concatenate(pieces, axis=0)
-        if reverse:
-            frames = frames[::-1]
-        if not is_int:
-            return frames
-        # like numpy, an all-integer index with an ellipsis gives a 0-d array, not a scalar
-        return frames[0, ...] if n_ellipsis else frames[0]
+            return np.empty((0, *self.shape[1:]), dtype=self.dtype)[spatial_key]
+        if len(pieces) == 1:
+            return pieces[0]
+        return np.concatenate(pieces, axis=0)
 
 
 class _QuantaBinFile:
@@ -897,13 +762,7 @@ def read_quanta_hdf5(path, load_data=False, return_meta=False):
         frames: (T, H, W) array, lazy unless load_data=True; or ``(frames, attrs)`` if
         return_meta=True.
     """
-    frames = _open_hdf5_frames(path)
-    attrs = _get_hdf5_attrs(frames.file)
-    if load_data:
-        f = frames.file
-        frames = frames[:]
-        f.close()
-    return (frames, attrs) if return_meta else frames
+    return _read_hdf5_frames(path, load_data=load_data, return_meta=return_meta)
 
 
 def read_quanta_auto(path, load_data=False, return_meta=False, H=None, W=None, key=None):
@@ -1126,7 +985,7 @@ def write_async_spad_zarr(
     # cap the flat arrays' chunks by bytes; offsets/lengths are (H, W) so leave them auto
     chunks = {
         # max(1, ...) so a dataset with no photons still gets a valid chunk shape
-        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize)),)
+        key: (max(1, _frames_per_chunk(data[key].size, data[key].itemsize, MAX_CHUNK_BYTES)),)
         for key in ("t", "y", "x")
     }
     return save_arrs_to_zarr(
