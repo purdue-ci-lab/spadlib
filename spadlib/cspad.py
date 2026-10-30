@@ -440,6 +440,9 @@ class cSPAD:
         command = bytes("I," + str(bitDepth) + ","+ str(intTime) + ","  +
                         str(iterations) + "," + "0," + str(overlap) + ",0" + ",1," + str(im_width), "utf8")
         self.t.send(command)
+        # Timeout of 10-15 seconds is required for SPAD Alpha to record above ~27k frames
+        # I think this is the correct way to set (set in the GUI normally)
+        self.t.settimeout(10.0)
         data = bytearray()
         img = np.empty([self.row,im_width,iterations], dtype=np.uint16)
         if bitDepth == 1:
