@@ -12,7 +12,16 @@ import socket
 import errno
 import numpy as np
 import time
+import h5py
 from tqdm import tqdm
+
+from spadlib.hdf5_utils import (
+    HDF5_MAX_CHUNK_BYTES,
+    HDF5_WRITE_BATCH_BYTES,
+    _hdf5_compression,
+    _set_hdf5_attrs,
+)
+from spadlib.utils import _frames_per_chunk
 
 
 class cSPAD:
@@ -542,7 +551,166 @@ class cSPAD:
 
         # return as (T, H, W)
         return img.transpose(2, 0, 1)
-   
+
+
+    def _check_im_width(self, im_width):
+        '''
+        Returns `im_width` if valid, otherwise the default width of 512.
+        '''
+        if not (im_width in self.col):
+            print("Chosen image width is invalid. Please use one of the following"
+                  " values: %s.\nDefault width of 512 is used instead!"
+                  % self.col)
+            im_width = 512
+        return im_width
+
+    def _start_binary(self, iterations, intTime, overlap, im_width):
+        '''
+        Starts a 1 bit intensity measurement (same command as get_intensity).
+        '''
+        command = bytes("I,1," + str(intTime) + ","  +
+                        str(iterations) + "," + "0," + str(overlap) + ",0" + ",1," + str(im_width), "utf8")
+        self.t.send(command)
+        self.t.settimeout(10.0)
+
+    def _unpack_binary(self, data, im_width):
+        '''
+        Unpacks bit packed 1 bit frames in `data` (a whole number of frames) into a
+        (T, H, W) uint8 array of 0/1 values.
+        '''
+        packed = np.frombuffer(data, dtype=np.uint8).reshape(-1, im_width, self.row // 8)
+        # each frame is streamed as (im_width, row) bits; rotate to (row, im_width)
+        return np.rot90(np.unpackbits(packed, axis=2), axes=(1, 2))
+
+    def get_binary(self, iterations, intTime, overlap, im_width):
+        '''
+        Starts a 1 bit intensity measurement with the SPAD512S system and returns the
+        binary frames. Same as get_intensity with bitDepth=1, but the frames are
+        unpacked in chunks rather than one at a time.
+
+        Parameters
+        ----------
+        iterations : int
+            Number of binary frames to record.
+        intTime : float
+            Integration time of each frame (in us).
+        overlap : int
+            1 for enabling read/exposure overlap, 0 otherwise
+        im_width : int
+            Valid values are 4, 8, 16, 32, 64 , 128, 256, 512
+
+        Returns
+        -------
+        img : uint8 array
+            (iterations, H, W) array of 0/1 values, or None if the measurement failed.
+
+        '''
+        im_width = self._check_im_width(im_width)
+        self._start_binary(iterations, intTime, overlap, im_width)
+        data = bytearray()
+        while 1:
+            data.extend(self.t.recv(32768))
+            if data[-4:] == bytearray("DONE", 'utf8'):
+                print("Process complete")
+                break
+            elif data[-5:] == bytearray("ERROR", 'utf8'):
+                print(data[-160:])
+                print("Completed the run with errors")
+                return None
+        del data[-4:]
+
+        bytes_per_image = self.row * im_width // 8
+        step = _frames_per_chunk(iterations, self.row * im_width, HDF5_WRITE_BATCH_BYTES)
+        img = np.empty((iterations, self.row, im_width), dtype=np.uint8)
+        for start in tqdm(range(0, iterations, step), desc="Loading frames"):
+            stop = min(start + step, iterations)
+            img[start:stop] = self._unpack_binary(
+                data[start * bytes_per_image:stop * bytes_per_image], im_width)
+        return img
+
+    def write_binary(self, path, iterations, intTime, overlap, im_width, compression_level=1):
+        '''
+        Starts a 1 bit intensity measurement with the SPAD512S system and writes the
+        binary frames to an HDF5 file as they are received, so the measurement is
+        never held in memory. The frames are stored as a (iterations, H, W) uint8
+        ``frames`` dataset, readable with spadlib.io.read_quanta_hdf5.
+
+        Parameters
+        ----------
+        path : str or Path
+            Path to the output HDF5 file (overwritten if it exists).
+        iterations : int
+            Number of binary frames to record.
+        intTime : float
+            Integration time of each frame (in us).
+        overlap : int
+            1 for enabling read/exposure overlap, 0 otherwise
+        im_width : int
+            Valid values are 4, 8, 16, 32, 64 , 128, 256, 512
+        compression_level : int
+            GZIP compression level, 0-9.
+
+        Returns
+        -------
+        path : str or Path
+            `path`, or None if the measurement failed (the file then holds only the
+            frames received before the error).
+
+        '''
+        compression = _hdf5_compression(compression_level)
+        im_width = self._check_im_width(im_width)
+        frame_nbytes = self.row * im_width  # unpacked
+        bytes_per_image = frame_nbytes // 8  # packed, as received
+        chunk_frames = _frames_per_chunk(iterations, frame_nbytes, HDF5_MAX_CHUNK_BYTES)
+        # unpack and write a run of whole HDF5 chunks at a time
+        step = chunk_frames * max(1, HDF5_WRITE_BATCH_BYTES // (chunk_frames * frame_nbytes))
+        step_nbytes = step * bytes_per_image
+
+        with h5py.File(path, "w") as f:
+            ds = f.create_dataset(
+                "frames",
+                shape=(iterations, self.row, im_width),
+                dtype=np.uint8,
+                chunks=(chunk_frames, self.row, im_width),
+                **compression,
+            )
+            # T_exp/fps as in spadlib.io._quanta_attrs, from the integration time (us)
+            _set_hdf5_attrs(f, {
+                "fps": 1e6 / intTime, "T_exp": iterations * intTime / 1e6,
+                "T": iterations, "H": self.row, "W": im_width, "shape": "(T, H, W)",
+                "intTime_us": intTime, "overlap": overlap,
+            })
+            self._start_binary(iterations, intTime, overlap, im_width)
+
+            buf = bytearray()
+            written = 0
+            with tqdm(total=iterations, desc="Writing frames") as pbar:
+                while 1:
+                    buf.extend(self.t.recv(32768))
+                    done = buf[-4:] == bytearray("DONE", 'utf8')
+                    if done:
+                        del buf[-4:]
+                    elif buf[-5:] == bytearray("ERROR", 'utf8'):
+                        print(buf[-160:])
+                        print("Completed the run with errors")
+                        return None
+                    # until DONE, keep the last 5 bytes so a DONE/ERROR split across
+                    # recv calls is still found
+                    while len(buf) >= step_nbytes + (0 if done else 5):
+                        chunk = buf[:step_nbytes]
+                        del buf[:step_nbytes]
+                        ds[written:written + step] = self._unpack_binary(chunk, im_width)
+                        written += step
+                        pbar.update(step)
+                    if done:
+                        break
+                if buf:
+                    n = len(buf) // bytes_per_image
+                    ds[written:written + n] = self._unpack_binary(buf, im_width)
+                    pbar.update(n)
+        print("Process complete")
+        return path
+
 
     '''
              ------------ Gated mode related functions ------------
