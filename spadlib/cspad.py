@@ -12,6 +12,7 @@ import socket
 import errno
 import numpy as np
 import time
+from tqdm import tqdm
 
 
 class cSPAD:
@@ -85,6 +86,9 @@ class cSPAD:
         self.nbrPix = self.row*self.col
         self.intBitDepths = [1,4,6,7,8,9,10,11,12]
         self.gatedBitDepths = [4,6,7,8, 9, 10, 11, 12]
+        # set the measurement time-out to 10 s (rounded to 5 s increments by the system)
+        self.t.send(bytes("TO,10", "utf-8"))
+        print(self.t.recv(8191).decode('utf-8'))
         print(4)
 
     def close(self):
@@ -395,7 +399,7 @@ class cSPAD:
           ------------ Intensity mode related functions ------------
     '''
 
-    def get_intensity(self, iterations, intTime, bitDepth, overlap, im_width):
+    def get_intensity(self, iterations, intTime, bitDepth, overlap, pileup, im_width):
         '''
         Starts an intensity measurement with the SPAD512S system, and returns true shifted values.
 
@@ -436,12 +440,13 @@ class cSPAD:
                   " values: %s.\nDefault width of 512 is used instead!"
                   % self.col)
             im_width = 512
+
+        if bitDepth != 1:
+            self.set_pileup(pileup)
        
         command = bytes("I," + str(bitDepth) + ","+ str(intTime) + ","  +
                         str(iterations) + "," + "0," + str(overlap) + ",0" + ",1," + str(im_width), "utf8")
         self.t.send(command)
-        # Timeout of 10-15 seconds is required for SPAD Alpha to record above ~27k frames
-        # I think this is the correct way to set (set in the GUI normally)
         self.t.settimeout(10.0)
         data = bytearray()
         img = np.empty([self.row,im_width,iterations], dtype=np.uint16)
@@ -469,7 +474,7 @@ class cSPAD:
 
             img = np.zeros((self.row, im_width, iterations), dtype=np.uint8)
         
-            for i in range(iterations):
+            for i in tqdm(range(iterations), desc="Loading frames"):
         
                 img_index_old = i * bytes_per_image
                 img_index = (i + 1) * bytes_per_image
@@ -489,9 +494,13 @@ class cSPAD:
                     data.extend(datablock)
                     if data[-4:] == bytearray("DONE", 'utf8'):
                         break
+                    elif data[-5:] == bytearray("ERROR", 'utf8'):
+                        print(data[-160:])
+                        print("Completed the run with errors")
+                        return None
                 data = data[:-4]
                 img_index = 0
-                for i in range(iterations):
+                for i in tqdm(range(iterations), desc="Loading frames"):
                     img_index_old = img_index
                     img_index = (i+1)*self.row*im_width*2
                     if img_index - img_index_old > 10:
@@ -507,17 +516,21 @@ class cSPAD:
                     data.extend(datablock)
                     if data[-4:] == bytearray("DONE", 'utf8'):
                         break
+                    elif data[-5:] == bytearray("ERROR", 'utf8'):
+                        print(data[-160:])
+                        print("Completed the run with errors")
+                        return None
                 data = data[:-4]
                 img_index = 0
                 if bitDepth < 9:
-                    for i in range(iterations):
+                    for i in tqdm(range(iterations), desc="Loading frames"):
                         img_index_old = img_index
                         img_index = (i+1)*self.row*im_width
                         if img_index - img_index_old > 10:
                             np_data = np.asarray(data[img_index_old:img_index])
                             img[:,:,i] = np.reshape(np_data,[self.row,im_width])
                 else:
-                    for i in range(iterations):
+                    for i in tqdm(range(iterations), desc="Loading frames"):
                         img_index_old = img_index
                         img_index = (i+1)*self.row*im_width*2
                         if img_index - img_index_old > 10:
