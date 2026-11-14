@@ -528,10 +528,7 @@ def write_video(
 
     if not is_video_file:
         allpaths = []
-    if verbose:
-        frameiterator = tqdm(range(max_frames), desc="Writing video frames")
-    else:
-        frameiterator = range(max_frames)
+    frameiterator = tqdm(range(max_frames), desc="Writing video frames", leave=verbose)
     for i in frameiterator:
         intensity = (np.clip(frames[i], vmin, vmax) - vmin) / (vmax - vmin)  # normalize to [0,1]
         if gamma != 1:
