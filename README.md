@@ -30,6 +30,15 @@ If the CUDA Toolkit is not installed already, install CuPy like the following:
 pip install "cupy-cuda12x[ctk]"
 ```
 
+### Updating to the latest version of spadlib
+
+I will not bother with releases and versions. I push to main you get the main.
+
+```shell
+uv lock --upgrade-package spadlib
+uv sync
+```
+
 ## Quick start
 
 ```python
@@ -91,3 +100,5 @@ alternative HDF5 and Zarr formats.
 uv sync
 uv run pytest
 ```
+
+Open issues, pull requests, whatever.
