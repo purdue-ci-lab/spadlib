@@ -1,7 +1,7 @@
 """
-Continuous-space simulation utilities: inhomogeneous Poisson point processes
-(IHPP) in 1D/2D/3D via thinning, plus flux-function generators that turn frame
-stacks or analytic models into continuous intensity functions lambda(x, y, t).
+SPAD data simulation utilities:
+- Quanta data: simulations from Bernoulli/Poisson probabilities per pixel.
+- For continuous data: inhomogeneous Poisson point processes (IHPP) in 1D/2D/3D via thinning.
 """
 import logging
 
@@ -15,7 +15,33 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 1D inhomogeneous point process functions
+# Quanta simulation functions
+# ---------------------------------------------------------------------------
+def photons_to_prob(photons, fps=None, dt=None):
+    """
+    Converts expected photon counts to Bernoulli probabilities for a given frame
+    exposure time.
+
+    Note each pixel can have more than one photon or be a float, and is expected to.
+    """
+    if fps is not None and dt is not None:
+        raise ValueError("Only one of 'fps' or 'dt' should be specified.")
+    if fps is not None:
+        dt = 1.0 / fps
+    if dt is None:
+        raise ValueError("Either 'fps' or 'dt' must be specified.")
+    return 1 - np.exp(-photons * dt)
+
+
+def simulate_quanta(prob_frames):
+    """
+    Simulate quanta frames from Bernoulli probabilities per pixel.
+    """
+    return np.random.binomial(1, prob_frames).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Continuous simulation functions
 # ---------------------------------------------------------------------------
 def simulate_ihpp1d(intensity_func, T, max_rate=None, seed=None):
     """
@@ -77,9 +103,6 @@ def apply_deadtime_1d(timestamps, deadtime):
     return np.array(accepted)
 
 
-# ---------------------------------------------------------------------------
-# 2D/3D inhomogeneous point process functions
-# ---------------------------------------------------------------------------
 def _make_grid(poly, nx=100, ny=100):
     """
     Build a regular grid over the polygon's bounding box, return cell centers,

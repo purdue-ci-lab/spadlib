@@ -18,12 +18,54 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Camera-specific per-frame probabilities, measured from 20k frames captured in complete
+# darkness; see add_darkcounts_lognormal_frames and add_hotpixels_frames.
+# dark count probabilities are lognormal over pixels, so these are parameters for that
+SPADALPHA_DARK_MEAN = 2.05e-4  # mean dark count probability over pixels
+SPADALPHA_DARK_SIGMA = 0.36  # std of log of per-pixel dark count probability
+SPADALPHA_HOT_PROB = 2.6e-3  # fraction of pixels that are hot (firing in >= 20% of frames)
+SPADALPHA_HOT_MIN_PROB = 0.2  # min hot pixel firing probability (max is 1)
+
 
 def prob_from_dcr(dcr_rate_hz, fps):
     """
     Convert a dark count rate in Hz to a per-frame probability of a dark count photon.
     """
     return 1 - np.exp(-dcr_rate_hz / fps)
+
+
+def random_indices(shape, p, seed=None):
+    """
+    Independently select each index of `shape` with probability `p`, returning the
+    selected indices as a tuple of arrays (like ``np.nonzero``), so ``arr[idx]`` works.
+
+    Equivalent to ``np.nonzero(rng.random(shape) < p)``, but optimized for small `p`:
+    instead of drawing one random number per element, it draws the geometric gaps
+    between consecutive selected flat indices, costing O(N * p) rather than O(N).
+
+    Args:
+        shape: tuple of ints, or an array whose ``.shape`` is used.
+        p: probability of selecting each index, in [0, 1].
+        seed: seed or ``np.random.Generator``.
+    """
+    shape = getattr(shape, "shape", shape)
+    if not (0.0 <= p <= 1.0):
+        raise ValueError("p must be in [0,1].")
+    n = int(np.prod(shape))
+    if p == 0 or n == 0:
+        return np.unravel_index(np.empty(0, dtype=np.int64), shape)
+    rng = np.random.default_rng(seed)
+    # enough gaps to cover all n elements in one batch with high probability
+    batch = int(n * p + 5 * np.sqrt(n * p) + 10)
+    chunks = []
+    last = -1
+    while last < n:
+        flat = last + np.cumsum(rng.geometric(p, size=batch))
+        chunks.append(flat)
+        last = flat[-1]
+    flat = np.concatenate(chunks)
+    flat = flat[:np.searchsorted(flat, n)]
+    return np.unravel_index(flat, shape)
 
 
 def thin_events_uniform(events, keep_prob, dcr_rate=None, return_idx=False, seed=None, cuda=False):
@@ -69,29 +111,44 @@ def thin_pixel_timeseries(pixel_timeseries, keep_prob, dcr_rate=None, seed=None,
     return thinned_pixel_timeseries
 
 
-def thin_frames_uniform(frames, p, dcr_prob=None, t_chunk=1000, seed=None):
+def thin_frames_uniform(frames, p, dcr_prob=None, copy=True, t_chunk=1000, seed=None):
     """
     Thin binary quanta frames uniformly, keeping each photon with probability `p`
     and optionally injecting dark counts. Processes the stack in temporal chunks.
+
+    Every element is kept with probability `p` regardless of whether it holds a photon
+    (zeroing a non-photon is a no-op), so no photon mask is needed. When `p` or `1 - p`
+    is small, only the affected indices are drawn (:func:`random_indices`); otherwise a
+    dense random mask is faster.
+
+    Args:
+        frames: binary array of shape (T, H, W).
+        p: probability of keeping each photon.
+        dcr_prob: if not None, per-frame probability of a dark count added to each pixel.
+        copy (bool): if True, modify and return a copy; otherwise modify `frames` in place.
+        t_chunk (int): number of frames processed at a time.
+        seed: seed or ``np.random.Generator``.
     """
     if not (0.0 <= p <= 1.0):
         raise ValueError("p must be in [0,1].")
-    if p == 1.0:
-        return
-    frames = np.copy(frames)  # avoid modifying in-place
-    P = frames.shape[0]
+    if copy:
+        frames = np.copy(frames)
+    T = frames.shape[0]
     rng = np.random.default_rng(seed=seed)
-    for t0 in tqdm(range(0, P, t_chunk), desc="Thinning frames in chunks"):
-        t1 = min(P, t0 + t_chunk)
-        slab = frames[t0:t1]  # (Bt,H,W) uint8
-        U = rng.random(slab.shape)  # float64, ephemeral
-        keep = (slab > 0) & (U < p)
+    for t0 in tqdm(range(0, T, t_chunk), desc="Thinning frames in chunks"):
+        slab = frames[t0:t0 + t_chunk]  # view
+        # at extreme values of p, use sparse index sampling instead of dense
+        if p <= 0.1:  # keep few: save the kept elements, zero the rest
+            idx = random_indices(slab.shape, p, seed=rng)
+            kept = slab[idx]
+            slab[...] = 0
+            slab[idx] = kept
+        elif p >= 0.9:  # drop few
+            slab[random_indices(slab.shape, 1 - p, seed=rng)] = 0
+        else:  # dense sampling
+            slab *= rng.random(slab.shape, dtype=np.float32) < p
         if dcr_prob is not None:
-            dcr_mask = rng.random(slab.shape) < dcr_prob
-            keep = keep | dcr_mask
-        slab[...] = 0
-        slab[keep] = 1
-        frames[t0:t1] = slab
+            slab[random_indices(slab.shape, dcr_prob, seed=rng)] = 1
     return frames
 
 
@@ -158,6 +215,88 @@ def thin_frames_counts_dask(frames, keep_prob, dcr_rate=None, seed=None):
     del thinned
     del frames
     return out
+
+
+def add_darkcounts_lognormal_frames(frames, mean, sigma, copy=True, seed=None):
+    """
+    Add dark counts to binary frames of shape (T, H, W).
+
+    Each pixel gets its own per-frame dark count probability
+    ``p = mean * LogNormal(-sigma**2 / 2, sigma)`` (so the mean over pixels is `mean`),
+    and fires independently in every frame with that probability.
+
+    For the SPAD Alpha, use SPADALPHA_DARK_MEAN and SPADALPHA_DARK_SIGMA: in a darkness
+    capture, the dark count probabilities of non-hot pixels fit a lognormal much better
+    than a single shared probability (Poisson counts).
+
+    Args:
+        frames: binary array of shape (T, H, W).
+        mean: mean per-frame dark count probability over pixels.
+        sigma: std of the log of the per-pixel dark count probability.
+        copy (bool): if True, modify and return a copy; otherwise modify `frames` in place.
+        seed: seed or ``np.random.Generator``.
+    """
+    rng = np.random.default_rng(seed)
+    p = mean * rng.lognormal(-sigma ** 2 / 2, sigma, size=frames.shape[1:])
+    # draw candidates at the largest probability, then keep each with p / p_max
+    p_max = p.max()
+    t, y, x = random_indices(frames.shape, p_max, seed=rng)
+    keep = rng.random(t.size) * p_max < p[y, x]
+    if copy:
+        frames = np.copy(frames)
+    frames[t[keep], y[keep], x[keep]] = 1
+    return frames
+
+
+def add_darkcounts_fixed_frames(frames, prob, copy=True, seed=None):
+    """
+    Add dark counts to binary frames of shape (T, H, W), with the same per-frame dark
+    count probability `prob` for every pixel. See :func:`add_darkcounts_lognormal_frames`
+    for per-pixel probabilities, which fit real sensors better.
+
+    Args:
+        frames: binary array of shape (T, H, W).
+        prob: per-frame dark count probability of each pixel.
+        copy (bool): if True, modify and return a copy; otherwise modify `frames` in place.
+        seed: seed or ``np.random.Generator``.
+    """
+    if copy:
+        frames = np.copy(frames)
+    frames[random_indices(frames.shape, prob, seed=seed)] = 1
+    return frames
+
+
+def add_hotpixels_frames(frames, hot_prob, min_prob, max_prob=1.0, copy=True, t_chunk=1000, seed=None):
+    """
+    Turn a random subset of pixels in binary frames of shape (T, H, W) into hot pixels.
+
+    Each pixel is chosen to be hot with probability `hot_prob`. A hot pixel gets its own
+    per-frame firing probability ``p ~ Uniform(min_prob, max_prob)``, and its whole time
+    series is replaced by i.i.d. Bernoulli(p).
+
+    For the SPAD Alpha, use SPADALPHA_HOT_PROB and SPADALPHA_HOT_MIN_PROB: in a darkness
+    capture, hot pixels (firing in >= 20% of frames) were spatially uncorrelated, roughly
+    uniform in p up to 1 (somewhat decreasing), and fired consistently with i.i.d.
+    Bernoulli in time (no bursts / telegraph noise).
+
+    Args:
+        frames: binary array of shape (T, H, W).
+        hot_prob: probability of each pixel being hot.
+        min_prob, max_prob: range of a hot pixel's per-frame firing probability.
+        copy (bool): if True, modify and return a copy; otherwise modify `frames` in place.
+        t_chunk (int): number of frames generated at a time.
+        seed: seed or ``np.random.Generator``.
+    """
+    T = frames.shape[0]
+    rng = np.random.default_rng(seed)
+    ys, xs = random_indices(frames.shape[1:], hot_prob, seed=rng)
+    p = rng.uniform(min_prob, max_prob, size=ys.size)
+    if copy:
+        frames = np.copy(frames)
+    for t0 in range(0, T, t_chunk):
+        t1 = min(T, t0 + t_chunk)
+        frames[t0:t1, ys, xs] = rng.random((t1 - t0, ys.size)) < p
+    return frames
 
 
 def accumulate_frames(frames, n, dtype=None, t_chunk=1000):
